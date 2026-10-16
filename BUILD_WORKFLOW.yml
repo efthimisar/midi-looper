@@ -1,0 +1,51 @@
+name: Build MIDI Looper
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Engine tests (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          clang++ -std=c++17 -O1 Tests/engine_tests.cpp -o engine_tests
+          ./engine_tests
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p out
+          for d in build/*_artefacts/Release/VST3/*.vst3 build/*_artefacts/Release/AU/*.component; do
+            codesign --force --deep --sign - "$d"
+            cp -R "$d" out/
+          done
+          cd out && zip -r -y ../MidiLooper-macOS.zip .
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Get-ChildItem build -Recurse -Directory -Filter *.vst3 | Where-Object { $_.FullName -match 'Release' } | ForEach-Object { Copy-Item $_.FullName out -Recurse -Force }
+          Compress-Archive -Path out\* -DestinationPath MidiLooper-Windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MidiLooper-${{ runner.os }}
+          path: MidiLooper-*.zip
