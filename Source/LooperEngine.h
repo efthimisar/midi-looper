@@ -59,6 +59,8 @@ struct Settings
     AfterRecord afterRecord = AfterRecord::Play;
     bool syncToHost = false;
     bool passThrough = true;
+    bool doubleTap = true;          // STOP,STOP γρήγορα = UNDO · REDO,REDO γρήγορα = CLEAR
+    double doubleTapMs = 400.0;     // μέγιστο διάστημα ανάμεσα στα δύο πατήματα
 };
 
 class LooperEngine
@@ -114,13 +116,14 @@ public:
             advance (cursor, off, out);
             cursor = off;
 
-            if (in[i].isCommand) doCommand (in[i].cmd, off, info, out);
+            if (in[i].isCommand) dispatchCommand (in[i].cmd, off, info, out);
             else                 handleMidi (in[i].msg, off, out);
         }
         advance (cursor, info.numSamples, out);
 
         lastHostEnd = info.hostSample + info.numSamples;
         lastHostValid = info.hostPlaying && info.hostPositionValid;
+        clock += info.numSamples;
     }
 
 private:
@@ -166,6 +169,11 @@ private:
     int64_t armedBoundary = 0;      // θέση host (samples) όπου ξεκινά η ηχογράφηση
     int64_t blockHostStart = 0;     // θέση host στην αρχή του τρέχοντος block
 
+    // ---------- διπλό πάτημα ----------
+    int64_t clock = 0;              // samples που έχουν περάσει (δεν εξαρτάται από τον host)
+    int64_t lastStopTap = 0, lastRedoTap = 0;
+    bool stopTapValid = false, redoTapValid = false;
+
     void hardReset()
     {
         state = State::Empty; length = 0; redoLength = 0; pos = 0;
@@ -175,6 +183,7 @@ private:
         sustainRec.fill (false);
         outCount.fill (0); sustainOut.fill (false); bendOut.fill (false); liveHeld.fill (false);
         anchorValid = false; pausedByHost = false; lastHostValid = false;
+        stopTapValid = false; redoTapValid = false;
     }
 
     // ---------- έξοδος ----------
@@ -569,6 +578,30 @@ private:
             redoLength = length;
             length = 0; pos = 0; state = State::Empty; anchorValid = false;
         }
+    }
+
+    // Διπλό πάτημα: το πρώτο πάτημα εκτελείται κανονικά και αμέσως. Αν το ίδιο κουμπί
+    // ξαναπατηθεί μέσα στο χρονικό όριο, το δεύτερο γίνεται UNDO (από STOP) ή CLEAR (από REDO).
+    void dispatchCommand (Command c, int offset, const BlockInfo& info, std::vector<OutEvent>& out)
+    {
+        if (c == Command::Stop || c == Command::Redo)
+        {
+            const bool isStop = (c == Command::Stop);
+            bool& valid = isStop ? stopTapValid : redoTapValid;
+            int64_t& last = isStop ? lastStopTap : lastRedoTap;
+            const int64_t now = clock + offset;
+            const int64_t window = (int64_t) (settings.doubleTapMs * 0.001 * sr);
+
+            if (settings.doubleTap && valid && now - last <= window)
+            {
+                valid = false;
+                doCommand (isStop ? Command::Undo : Command::Clear, offset, info, out);
+                return;
+            }
+            if (settings.doubleTap) { valid = true; last = now; }
+            else valid = false;
+        }
+        doCommand (c, offset, info, out);
     }
 
     void doCommand (Command c, int offset, const BlockInfo& info, std::vector<OutEvent>& out)

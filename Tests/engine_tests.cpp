@@ -405,6 +405,67 @@ int main()
         CHECK (e.getState() == State::Recording, "χωρίς host δεν ξεκίνησε η ηχογράφηση");
     }
 
+    // 24-29) διπλό πάτημα: STOP,STOP γρήγορα = UNDO · REDO,REDO γρήγορα = CLEAR
+    {
+        auto twoLayers = [] ()
+        {
+            Script s;
+            s.cmd (1000, Command::Main); s.on (1100, 60); s.off (1600, 60); s.cmd (3000, Command::Main);   // layer 1, μήκος 2000
+            s.cmd (4000, Command::Main); s.on (4100, 64); s.off (4600, 64); s.cmd (6000, Command::Main);   // layer 2
+            return s;
+        };
+
+        // 24) γρήγορο STOP,STOP → UNDO (μένει 1 layer, σταματημένο)
+        {
+            Script s = twoLayers(); s.cmd (7000, Command::Stop); s.cmd (7000 + 5000, Command::Stop);
+            LooperEngine e; auto o = run (s, 30000, 64, noThru(), nullptr, 0.0, &e);
+            CHECK (e.getLayerCount() == 1, "STOP,STOP γρήγορα: layers=%d αντί για 1", e.getLayerCount());
+            CHECK (e.getState() == State::Stopped, "STOP,STOP γρήγορα: δεν είναι σταματημένο");
+            CHECK (balanced (o), "stuck note στο STOP,STOP");
+        }
+        // 25) αργό STOP,STOP → απλό STOP, κανένα undo
+        {
+            Script s = twoLayers(); s.cmd (7000, Command::Stop); s.cmd (7000 + 30000, Command::Stop);
+            LooperEngine e; run (s, 60000, 64, noThru(), nullptr, 0.0, &e);
+            CHECK (e.getLayerCount() == 2, "STOP αργά: layers=%d αντί για 2", e.getLayerCount());
+            CHECK (e.getState() == State::Stopped, "STOP αργά: δεν είναι σταματημένο");
+        }
+        // 26) γρήγορο REDO,REDO → CLEAR
+        {
+            Script s = twoLayers(); s.cmd (7000, Command::Redo); s.cmd (7000 + 5000, Command::Redo);
+            LooperEngine e; auto o = run (s, 30000, 64, noThru(), nullptr, 0.0, &e);
+            CHECK (e.getState() == State::Empty && e.getLength() == 0 && e.getLayerCount() == 0,
+                   "REDO,REDO γρήγορα δεν έκανε clear");
+            CHECK (balanced (o), "stuck note στο REDO,REDO");
+        }
+        // 27) με το διπλό πάτημα κλειστό δεν αλλάζει τίποτα
+        {
+            Settings st = noThru(); st.doubleTap = false;
+            Script s = twoLayers(); s.cmd (7000, Command::Stop); s.cmd (7000 + 5000, Command::Stop);
+            Script r = twoLayers(); r.cmd (7000, Command::Redo); r.cmd (7000 + 5000, Command::Redo);
+            LooperEngine e1, e2; run (s, 30000, 64, st, nullptr, 0.0, &e1); run (r, 30000, 64, st, nullptr, 0.0, &e2);
+            CHECK (e1.getLayerCount() == 2, "doubleTap off: το STOP,STOP έκανε undo");
+            CHECK (e2.getState() == State::Playing && e2.getLayerCount() == 2, "doubleTap off: το REDO,REDO έκανε clear");
+        }
+        // 28) τρίτο γρήγορο STOP δεν κάνει δεύτερο undo (ξεκινά νέο ζευγάρι)
+        {
+            Script s = twoLayers(); s.cmd (7000, Command::Stop); s.cmd (8000, Command::Stop); s.cmd (9000, Command::Stop);
+            LooperEngine e; run (s, 30000, 64, noThru(), nullptr, 0.0, &e);
+            CHECK (e.getLayerCount() == 1, "3 γρήγορα STOP: layers=%d αντί για 1", e.getLayerCount());
+        }
+        // 29) ίδιο αποτέλεσμα για κάθε μέγεθος block
+        {
+            Script s = twoLayers(); s.cmd (7000, Command::Stop); s.cmd (7000 + 5000, Command::Stop);
+            auto ref = run (s, 30000, 64, noThru());
+            for (int bs : { 1, 7, 480, 1000, 4096 })
+            {
+                LooperEngine e; auto o = run (s, 30000, bs, noThru(), nullptr, 0.0, &e);
+                CHECK (o == ref, "διπλό STOP: block size %d δίνει διαφορετική έξοδο", bs);
+                CHECK (e.getLayerCount() == 1, "διπλό STOP: block size %d layers=%d", bs, e.getLayerCount());
+            }
+        }
+    }
+
     if (failures == 0) std::printf("ΟΛΑ ΤΑ TESTS ΠΕΡΑΣΑΝ\n");
     else std::printf("%d αποτυχίες\n", failures);
     return failures == 0 ? 0 : 1;
