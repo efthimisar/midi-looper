@@ -10,7 +10,7 @@ namespace
 LooperEditor::LooperEditor (LooperProcessor& p)
     : AudioProcessorEditor (&p), proc (p)
 {
-    setSize (600, 330);
+    setSize (660, 420);
 
     statusLabel.setJustificationType (juce::Justification::centredLeft);
     statusLabel.setFont (juce::FontOptions (18.0f, juce::Font::bold));
@@ -44,14 +44,17 @@ LooperEditor::LooperEditor (LooperProcessor& p)
         addAndMakeVisible (ml);
     }
 
+    startLabel.setText ("Start quantize (needs host playing)", juce::dontSendNotification);
     quantizeLabel.setText ("Length quantize", juce::dontSendNotification);
     afterLabel.setText ("After first loop", juce::dontSendNotification);
     bpbLabel.setText ("Beats per bar (if host has none)", juce::dontSendNotification);
     bpmLabel.setText ("Fallback BPM (if host has none)", juce::dontSendNotification);
-    for (auto* l : { &quantizeLabel, &afterLabel, &bpbLabel, &bpmLabel }) addAndMakeVisible (l);
+    for (auto* l : { &startLabel, &quantizeLabel, &afterLabel, &bpbLabel, &bpmLabel }) addAndMakeVisible (l);
 
+    startBox.addItemList ({ "Off", "Beat", "Bar" }, 1);
     quantizeBox.addItemList ({ "Off", "Beat", "Bar" }, 1);
     afterBox.addItemList ({ "Play", "Overdub" }, 1);
+    addAndMakeVisible (startBox);
     addAndMakeVisible (quantizeBox);
     addAndMakeVisible (afterBox);
 
@@ -67,6 +70,7 @@ LooperEditor::LooperEditor (LooperProcessor& p)
     consumeToggle.setButtonText ("Swallow mapped controls");
     for (auto* t : { &syncToggle, &thruToggle, &consumeToggle }) addAndMakeVisible (t);
 
+    startAtt    = std::make_unique<Combo> (proc.apvts, "startQuantize", startBox);
     quantizeAtt = std::make_unique<Combo> (proc.apvts, "quantize", quantizeBox);
     afterAtt    = std::make_unique<Combo> (proc.apvts, "afterRecord", afterBox);
     bpbAtt      = std::make_unique<Slide> (proc.apvts, "beatsPerBar", bpbSlider);
@@ -89,6 +93,7 @@ void LooperEditor::paint (juce::Graphics& g)
     const auto state = (ml::State) shownState;
     g.setColour (state == ml::State::Recording   ? juce::Colour (0xffe5484d)
                : state == ml::State::Overdubbing ? juce::Colour (0xfff5a524)
+               : state == ml::State::Armed       ? juce::Colour (0xfff5d90a)
                : juce::Colour (0xff3dd68c));
     g.fillRoundedRectangle (progressArea.toFloat().withWidth (progressArea.getWidth() * progress), 4.0f);
 }
@@ -117,7 +122,7 @@ void LooperEditor::resized()
     }
 
     r.removeFromTop (14);
-    const int labelW = 230;
+    const int labelW = 280;
     auto line = [&] (juce::Component& label, juce::Component& control)
     {
         auto a = r.removeFromTop (28);
@@ -125,6 +130,7 @@ void LooperEditor::resized()
         control.setBounds (a.reduced (0, 2));
         r.removeFromTop (4);
     };
+    line (startLabel, startBox);
     line (quantizeLabel, quantizeBox);
     line (afterLabel, afterBox);
     line (bpbLabel, bpbSlider);
@@ -152,6 +158,7 @@ void LooperEditor::timerCallback()
         case ml::State::Playing:     text = "PLAYING"; break;
         case ml::State::Overdubbing: text = "OVERDUBBING"; break;
         case ml::State::Stopped:     text = "Stopped"; break;
+        case ml::State::Armed:       text = "ARMED: waiting for the next beat/bar (press REC again to cancel)"; break;
     }
     if (len > 0)
         text += "   |   loop " + juce::String ((double) len / sr, 2) + " s   |   layers " + juce::String (proc.uiLayers.load());
@@ -161,6 +168,7 @@ void LooperEditor::timerCallback()
     progress = (state == ml::State::Recording || len <= 0) ? 0.0f
              : juce::jlimit (0.0f, 1.0f, (float) pos / (float) len);
     if (state == ml::State::Recording) progress = 1.0f;
+    if (state == ml::State::Armed) progress = 0.0f;
 
     if (shownState != (int) state)
     {
@@ -169,11 +177,13 @@ void LooperEditor::timerCallback()
                              : state == ml::State::Recording   ? "PLAY"
                              : state == ml::State::Playing     ? "OVERDUB"
                              : state == ml::State::Overdubbing ? "PLAY"
+                             : state == ml::State::Armed       ? "CANCEL"
                              : "PLAY";
         cmdButtons[0].setButtonText (mainText);
         cmdButtons[0].setColour (juce::TextButton::buttonColourId,
                                  state == ml::State::Recording   ? juce::Colour (0xffe5484d)
                                : state == ml::State::Overdubbing ? juce::Colour (0xfff5a524)
+                               : state == ml::State::Armed       ? juce::Colour (0xffb59a00)
                                : getLookAndFeel().findColour (juce::TextButton::buttonColourId));
     }
 

@@ -27,6 +27,7 @@ LooperProcessor::LooperProcessor()
     for (auto& m : mapping) m.store (-1);
 
     pQuantize     = apvts.getRawParameterValue ("quantize");
+    pStartQuantize = apvts.getRawParameterValue ("startQuantize");
     pBeatsPerBar  = apvts.getRawParameterValue ("beatsPerBar");
     pFallbackBpm  = apvts.getRawParameterValue ("fallbackBpm");
     pAfterRecord  = apvts.getRawParameterValue ("afterRecord");
@@ -42,6 +43,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout LooperProcessor::createLayou
     using namespace juce;
     AudioProcessorValueTreeState::ParameterLayout l;
 
+    l.add (std::make_unique<AudioParameterChoice> (ParameterID { "startQuantize", 1 }, "Start Quantize",
+                                                   StringArray { "Off", "Beat", "Bar" }, 0));
     l.add (std::make_unique<AudioParameterChoice> (ParameterID { "quantize", 1 }, "Length Quantize",
                                                    StringArray { "Off", "Beat", "Bar" }, 0));
     l.add (std::make_unique<AudioParameterInt> (ParameterID { "beatsPerBar", 1 }, "Beats per Bar", 1, 16, 4));
@@ -113,11 +116,16 @@ void LooperProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::MidiB
             info.hostPlaying = pos->getIsPlaying();
             if (auto t = pos->getTimeInSamples()) { info.hostSample = *t; info.hostPositionValid = true; }
             if (auto b = pos->getBpm())           info.bpm = *b;
-            if (auto ts = pos->getTimeSignature()) info.beatsPerBar = ts->numerator;
+            if (auto ts = pos->getTimeSignature())
+                if (ts->denominator > 0)
+                    info.barLengthQN = (double) ts->numerator * 4.0 / (double) ts->denominator;
+            if (auto q = pos->getPpqPosition())               { info.ppq = *q; info.ppqValid = true; }
+            if (auto bs = pos->getPpqPositionOfLastBarStart()) { info.barStartPpq = *bs; info.barStartValid = true; }
         }
 
     ml::Settings st;
     st.quantize     = (ml::Quantize) juce::jlimit (0, 2, (int) pQuantize->load());
+    st.startQuantize = (ml::Quantize) juce::jlimit (0, 2, (int) pStartQuantize->load());
     st.beatsPerBar  = (int) pBeatsPerBar->load();
     st.fallbackBpm  = pFallbackBpm->load();
     st.afterRecord  = (ml::AfterRecord) juce::jlimit (0, 1, (int) pAfterRecord->load());

@@ -12,7 +12,7 @@
 namespace ml
 {
 enum class Command { Main, Stop, Undo, Redo, Clear };
-enum class State { Empty, Recording, Playing, Overdubbing, Stopped };
+enum class State { Empty, Recording, Playing, Overdubbing, Stopped, Armed };   // Armed = περιμένει το πλέγμα για να ξεκινήσει
 enum class Quantize { Off, Beat, Bar };
 enum class AfterRecord { Play, Overdub };
 
@@ -43,12 +43,17 @@ struct BlockInfo
     bool hostPositionValid = false;
     int64_t hostSample = 0;   // θέση του host στην αρχή του block (samples)
     double bpm = 0.0;         // 0 = άγνωστο
-    int beatsPerBar = 0;      // 0 = άγνωστο
+    double barLengthQN = 0.0; // μήκος μέτρου σε τέταρτα (4/4 → 4, 6/8 → 3), 0 = άγνωστο
+    bool ppqValid = false;
+    double ppq = 0.0;         // θέση σε τέταρτα στην αρχή του block
+    bool barStartValid = false;
+    double barStartPpq = 0.0; // θέση σε τέταρτα της αρχής του τρέχοντος μέτρου
 };
 
 struct Settings
 {
-    Quantize quantize = Quantize::Off;
+    Quantize quantize = Quantize::Off;        // στρογγυλοποίηση του ΜΗΚΟΥΣ
+    Quantize startQuantize = Quantize::Off;   // εκκίνηση ηχογράφησης στο επόμενο beat/μέτρο
     int beatsPerBar = 4;
     double fallbackBpm = 120.0;
     AfterRecord afterRecord = AfterRecord::Play;
@@ -99,6 +104,7 @@ public:
             in[j + 1] = e;
         }
 
+        blockHostStart = info.hostSample;
         syncAtBlockStart (info, out);
 
         int cursor = 0;
@@ -157,6 +163,8 @@ private:
     int64_t lastHostEnd = 0;
     bool lastHostValid = false;
     bool pausedByHost = false;
+    int64_t armedBoundary = 0;      // θέση host (samples) όπου ξεκινά η ηχογράφηση
+    int64_t blockHostStart = 0;     // θέση host στην αρχή του τρέχοντος block
 
     void hardReset()
     {
@@ -363,8 +371,18 @@ private:
         releaseControllers (offset, out);
     }
 
+    // Αν περιμένουμε το πλέγμα και η στιγμή `at` (offset μέσα στο block) το έχει φτάσει, ξεκινά η ηχογράφηση.
+    void maybeStartArmed (int at)
+    {
+        if (state != State::Armed) return;
+        const int64_t bOff = armedBoundary - blockHostStart;
+        if (bOff <= at) { state = State::Recording; pos = at - bOff; }
+    }
+
     void advance (int from, int to, std::vector<OutEvent>& out)
     {
+        if (state == State::Armed) { maybeStartArmed (to); return; }
+
         int remaining = to - from;
         if (remaining <= 0) return;
 
@@ -386,6 +404,14 @@ private:
     // ---------- host sync ----------
     void syncAtBlockStart (const BlockInfo& info, std::vector<OutEvent>& out)
     {
+        // Αν ο host σταμάτησε ή έκανε άλμα ενώ περιμέναμε το πλέγμα, ακυρώνεται η αναμονή.
+        if (state == State::Armed)
+        {
+            const bool contiguous = info.hostPlaying && info.hostPositionValid && lastHostValid
+                                    && info.hostSample == lastHostEnd;
+            if (! contiguous) state = State::Empty;
+        }
+
         const bool active = settings.syncToHost && anchorValid && length > 0
                             && (state == State::Playing || state == State::Overdubbing);
         if (! active) { pausedByHost = false; return; }
@@ -418,8 +444,8 @@ private:
         raw = std::max<int64_t> (1, raw);
         if (settings.quantize == Quantize::Off) return raw;
         const double bpm = info.bpm > 0.0 ? info.bpm : settings.fallbackBpm;
-        const int bpb = info.beatsPerBar > 0 ? info.beatsPerBar : std::max (1, settings.beatsPerBar);
-        const double unit = 60.0 * sr / bpm * (settings.quantize == Quantize::Bar ? bpb : 1);
+        const double barQN = info.barLengthQN > 0.0 ? info.barLengthQN : (double) std::max (1, settings.beatsPerBar);
+        const double unit = 60.0 * sr / bpm * (settings.quantize == Quantize::Bar ? barQN : 1.0);
         const double n = std::max (1.0, std::floor ((double) raw / unit + 0.5));
         return std::max<int64_t> (1, (int64_t) std::llround (n * unit));
     }
@@ -429,6 +455,35 @@ private:
         anchorValid = info.hostPlaying && info.hostPositionValid;
         anchor = info.hostSample + offset;
         pausedByHost = false;
+    }
+
+    // Επόμενο όριο beat/μέτρου του host, σε απόλυτη θέση host (samples).
+    // Επιστρέφει false αν ο host δεν παίζει ή δεν ξέρουμε το πλέγμα.
+    bool nextGridBoundary (int offset, const BlockInfo& info, int64_t& boundaryHost) const
+    {
+        if (! (info.hostPlaying && info.hostPositionValid)) return false;
+
+        const double bpm = info.bpm > 0.0 ? info.bpm : settings.fallbackBpm;
+        const double samplesPerQN = 60.0 * sr / bpm;
+        const double barQN = info.barLengthQN > 0.0 ? info.barLengthQN : (double) std::max (1, settings.beatsPerBar);
+        const double unit = settings.startQuantize == Quantize::Bar ? barQN : 1.0;
+
+        double ppqNow, origin = 0.0;
+        if (info.ppqValid)
+        {
+            ppqNow = info.ppq + (double) offset / samplesPerQN;
+            if (info.barStartValid) origin = info.barStartPpq;
+        }
+        else
+            ppqNow = (double) (info.hostSample + offset) / samplesPerQN;   // υποθέτει σταθερό tempo από το 0
+
+        const double rel = (ppqNow - origin) / unit;
+        const double fl = std::floor (rel);
+        const double pastSamples = (rel - fl) * unit * samplesPerQN;      // πόσα samples μετά το προηγούμενο όριο
+        const double nextRel = pastSamples < 0.5 ? fl : fl + 1.0;         // <0.5 sample: είμαστε πάνω στο όριο
+        const double delta = (origin + nextRel * unit - ppqNow) * samplesPerQN;
+        boundaryHost = info.hostSample + offset + (int64_t) std::llround (std::max (0.0, delta));
+        return true;
     }
 
     void beginOverdub()
@@ -492,8 +547,12 @@ private:
         length = len;
         layerCount = 1;
         redoCount = 0;
-        pos = 0;
-        setAnchor (offset, info);
+        // Το loop συνεχίζει από το σημείο που βρισκόμαστε (όχι από την αρχή), ώστε η φάση του
+        // να μένει δεμένη με την αρχή της ηχογράφησης και, άρα, με το πλέγμα του host.
+        pos = raw % len;
+        anchorValid = info.hostPlaying && info.hostPositionValid;
+        anchor = info.hostSample + offset - raw;
+        pausedByHost = false;
         if (settings.afterRecord == AfterRecord::Overdub) beginOverdub();
         else state = State::Playing;
     }
@@ -523,8 +582,19 @@ private:
                         layers[0].events.clear(); layers[0].mine.fill (0);
                         layerCount = 0; redoCount = 0; redoLength = 0; length = 0;
                         discardHeld();
-                        pos = 0; state = State::Recording;
+                        pos = 0;
+                        state = State::Recording;
+                        if (settings.startQuantize != Quantize::Off)
+                        {
+                            int64_t b = 0;
+                            if (nextGridBoundary (offset, info, b) && b > info.hostSample + offset)
+                            {
+                                armedBoundary = b;
+                                state = State::Armed;
+                            }
+                        }
                         break;
+                    case State::Armed:       state = State::Empty; break;   // δεύτερο πάτημα = ακύρωση
                     case State::Recording:
                         if (pos <= 0) { state = State::Empty; layers[0].events.clear(); discardHeld(); }
                         else closeFirstLoop (offset, info);
@@ -537,7 +607,8 @@ private:
                 break;
 
             case Command::Stop:
-                if (state == State::Recording)
+                if (state == State::Armed) state = State::Empty;
+                else if (state == State::Recording)
                 {
                     if (pos <= 0) { state = State::Empty; layers[0].events.clear(); discardHeld(); }
                     else { closeFirstLoop (offset, info);
@@ -553,7 +624,8 @@ private:
                 break;
 
             case Command::Undo:
-                if (state == State::Recording)
+                if (state == State::Armed) state = State::Empty;
+                else if (state == State::Recording)
                 {
                     state = State::Empty; layers[0].events.clear(); discardHeld(); pos = 0;
                 }

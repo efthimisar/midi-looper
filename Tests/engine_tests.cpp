@@ -49,7 +49,12 @@ static std::vector<Out> run (const Script& sc, int64_t total, int bs, const Sett
                 in.push_back (e);
             }
         BlockInfo info; info.numSamples = n; info.bpm = bpm;
-        if (hostPos) { const int64_t h = hostPos (t0); info.hostPlaying = h >= 0; info.hostPositionValid = h >= 0; info.hostSample = h >= 0 ? h : 0; }
+        if (hostPos)
+        {
+            const int64_t h = hostPos (t0);
+            info.hostPlaying = h >= 0; info.hostPositionValid = h >= 0; info.hostSample = h >= 0 ? h : 0;
+            if (h >= 0 && bpm > 0.0) { info.ppqValid = true; info.ppq = (double) h * bpm / (60.0 * 48000.0); }
+        }
         eng.process (info, st, in.data(), (int) in.size(), out);
         for (auto& o : out) res.push_back ({ t0 + o.offset, o.msg.b[0], o.msg.b[1], o.msg.b[2] });
     }
@@ -204,8 +209,9 @@ int main()
         s.cmd (100000, Command::Main);
         auto o = run (s, 500000, 480, st, nullptr, 120.0);
         CHECK (balanced (o), "stuck note με quantize προς τα κάτω");
-        bool saw62 = false; for (auto& e : o) if (e.a == 62 && e.t == 100000 + 1000) saw62 = true;
-        CHECK (saw62, "το τυλιγμένο γεγονός δεν στη θέση 1000");
+        // Πάτημα στο 100000 ⇒ θέση loop 4000. Το γεγονός στη θέση 1000 παίζει στο επόμενο πέρασμα.
+        bool saw62 = false; for (auto& e : o) if (e.a == 62 && e.t == 100000 + (96000 - 4000) + 1000) saw62 = true;
+        CHECK (saw62, "το τυλιγμένο γεγονός δεν έπεσε στη σωστή θέση");
     }
 
     // 10) redo / clear / όριο layers
@@ -301,6 +307,102 @@ int main()
         Settings st = noThru(); st.afterRecord = AfterRecord::Overdub;
         LooperEngine e; run (basicScript(), 3500, 64, st, nullptr, 0.0, &e);
         CHECK (e.getState() == State::Overdubbing, "afterRecord=Overdub");
+    }
+
+
+    // ---------- Start quantize ----------
+    auto idHost = [] (int64_t t) -> int64_t { return t; };
+
+    // 17) ηχογράφηση που ξεκινά στο επόμενο μέτρο του host (120 bpm: μέτρο = 96000 samples)
+    {
+        Settings st = noThru(); st.startQuantize = Quantize::Bar; st.quantize = Quantize::Bar; st.syncToHost = true;
+        Script s;
+        s.cmd (30000, Command::Main);                     // πάτημα μέσα στο μέτρο 0 → περιμένει
+        s.on (50000, 61); s.off (55000, 61);              // πριν το πλέγμα: ΔΕΝ ηχογραφείται
+        s.on (97000, 60); s.off (98000, 60);              // 1000 samples μετά την αρχή του μέτρου 1
+        s.cmd (197000, Command::Main);                    // κλείσιμο μέσα στο μέτρο 2 → μήκος 1 μέτρο
+        std::vector<Out> ref;
+        for (int bs : { 64, 480, 1000, 1024, 7, 96000 })
+        {
+            LooperEngine e;
+            auto o = run (s, 400000, bs, st, idHost, 120.0, &e);
+            if (bs == 64) ref = o;
+            CHECK (o == ref, "start quantize: διαφορετική έξοδος με block %d", bs);
+            std::vector<Out> expect;
+            // το loop ξεκίνησε στο 96000. Περάσματα: 192000 (ήδη στη θέση 5000), 288000, 384000
+            for (int64_t base : { 288000, 384000 })
+            { expect.push_back ({ base + 1000, 0x90, 60, 100 }); expect.push_back ({ base + 2000, 0x80, 60, 0 }); }
+            CHECK (o == expect, "start quantize (block %d): %zu γεγονότα, πρώτο στο %lld", bs, o.size(),
+                   o.empty() ? -1LL : (long long) o[0].t);
+            CHECK (e.getLength() == 96000, "μήκος μετά το start quantize: %lld", (long long) e.getLength());
+        }
+    }
+
+    // 18) πάτημα ακριβώς πάνω στο όριο → ξεκινά αμέσως
+    {
+        Settings st = noThru(); st.startQuantize = Quantize::Bar;
+        Script s; s.cmd (96000, Command::Main);
+        LooperEngine e; run (s, 96100, 512, st, idHost, 120.0, &e);
+        CHECK (e.getState() == State::Recording && e.getPosition() == 100, "πάτημα πάνω στο όριο: state=%d pos=%lld",
+               (int) e.getState(), (long long) e.getPosition());
+    }
+
+    // 19) ο host σταματά όσο περιμένουμε → ακύρωση
+    {
+        Settings st = noThru(); st.startQuantize = Quantize::Bar;
+        Script s; s.cmd (30000, Command::Main);
+        auto hostStop = [] (int64_t t) -> int64_t { return t < 40000 ? t : -1; };
+        LooperEngine e; run (s, 120000, 256, st, hostStop, 120.0, &e);
+        CHECK (e.getState() == State::Empty, "Armed δεν ακυρώθηκε όταν σταμάτησε ο host (state=%d)", (int) e.getState());
+    }
+
+    // 20) δεύτερο πάτημα ενώ περιμένει → ακύρωση, και το Stop/Undo επίσης
+    {
+        Settings st = noThru(); st.startQuantize = Quantize::Bar;
+        Script s; s.cmd (30000, Command::Main); s.cmd (40000, Command::Main);
+        LooperEngine e; run (s, 50000, 256, st, idHost, 120.0, &e);
+        CHECK (e.getState() == State::Empty, "δεύτερο πάτημα δεν ακύρωσε");
+        Script s2; s2.cmd (30000, Command::Main); s2.cmd (40000, Command::Stop);
+        LooperEngine e2; run (s2, 50000, 256, st, idHost, 120.0, &e2);
+        CHECK (e2.getState() == State::Empty, "Stop δεν ακύρωσε");
+        Script s3; s3.cmd (30000, Command::Main); s3.cmd (40000, Command::Undo);
+        LooperEngine e3; run (s3, 50000, 256, st, idHost, 120.0, &e3);
+        CHECK (e3.getState() == State::Empty, "Undo δεν ακύρωσε");
+    }
+
+    // 21) νότα ακριβώς στο sample του ορίου ηχογραφείται στη θέση 0
+    {
+        Settings st = noThru(); st.startQuantize = Quantize::Bar; st.quantize = Quantize::Bar;
+        Script s; s.cmd (30000, Command::Main); s.on (96000, 62); s.off (96500, 62); s.cmd (192000, Command::Main);
+        for (int bs : { 1000, 1024, 96000 })
+        {
+            auto o = run (s, 200000, bs, st, idHost, 120.0);
+            CHECK (!o.empty() && o[0].t == 192000 && o[0].a == 62, "νότα στο όριο (block %d): πρώτο γεγονός στο %lld", bs,
+                   o.empty() ? -1LL : (long long) o[0].t);
+        }
+    }
+
+    // 22) start quantize σε beat (24000 samples) + length quantize σε beat
+    {
+        Settings st = noThru(); st.startQuantize = Quantize::Beat; st.quantize = Quantize::Beat; st.syncToHost = true;
+        Script s;
+        s.cmd (30000, Command::Main);                    // επόμενο beat: 48000
+        s.on (49000, 60); s.off (50000, 60);             // θέση 1000..2000 του loop
+        s.cmd (75000, Command::Main);                    // raw = 27000 → μήκος 24000, θέση 3000
+        LooperEngine e;
+        auto o = run (s, 130000, 333, st, idHost, 120.0, &e);
+        CHECK (e.getLength() == 24000, "beat start/length quantize: μήκος %lld", (long long) e.getLength());
+        bool ok = false; for (auto& x : o) if (x.t == 96000 + 1000 && x.a == 60 && (x.s & 0xF0) == 0x90) ok = true;
+        CHECK (ok, "το loop δεν είναι δεμένο στο πλέγμα του beat");
+        CHECK (balanced (o), "stuck note με beat quantize");
+    }
+
+    // 23) χωρίς host που παίζει, το start quantize δεν μπλοκάρει: ξεκινά αμέσως
+    {
+        Settings st = noThru(); st.startQuantize = Quantize::Bar;
+        Script s; s.cmd (30000, Command::Main);
+        LooperEngine e; run (s, 31000, 256, st, nullptr, 0.0, &e);
+        CHECK (e.getState() == State::Recording, "χωρίς host δεν ξεκίνησε η ηχογράφηση");
     }
 
     if (failures == 0) std::printf("ΟΛΑ ΤΑ TESTS ΠΕΡΑΣΑΝ\n");

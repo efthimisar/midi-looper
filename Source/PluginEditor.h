@@ -23,15 +23,15 @@ private:
     std::array<juce::TextButton, LooperProcessor::kNumCommands> clearButtons;
     std::array<juce::Label, LooperProcessor::kNumCommands> mapLabels;
 
-    juce::Label quantizeLabel, bpbLabel, bpmLabel, afterLabel;
-    juce::ComboBox quantizeBox, afterBox;
+    juce::Label startLabel, quantizeLabel, bpbLabel, bpmLabel, afterLabel;
+    juce::ComboBox startBox, quantizeBox, afterBox;
     juce::Slider bpbSlider, bpmSlider;
     juce::ToggleButton syncToggle, thruToggle, consumeToggle;
 
     using Combo  = juce::AudioProcessorValueTreeState::ComboBoxAttachment;
     using Slide  = juce::AudioProcessorValueTreeState::SliderAttachment;
     using Button = juce::AudioProcessorValueTreeState::ButtonAttachment;
-    std::unique_ptr<Combo> quantizeAtt, afterAtt;
+    std::unique_ptr<Combo> startAtt, quantizeAtt, afterAtt;
     std::unique_ptr<Slide> bpbAtt, bpmAtt;
     std::unique_ptr<Button> syncAtt, thruAtt, consumeAtt;
 

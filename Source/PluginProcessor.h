@@ -70,6 +70,7 @@ private:
 
     // παράμετροι
     std::atomic<float>* pQuantize = nullptr;
+    std::atomic<float>* pStartQuantize = nullptr;
     std::atomic<float>* pBeatsPerBar = nullptr;
     std::atomic<float>* pFallbackBpm = nullptr;
     std::atomic<float>* pAfterRecord = nullptr;
