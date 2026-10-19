@@ -3,17 +3,10 @@
 
 namespace
 {
-    const char* const kTriggerIds[LooperProcessor::kNumCommands]   = { "trgMain", "trgStop", "trgUndo", "trgRedo", "trgClear" };
-    const char* const kTriggerNames[LooperProcessor::kNumCommands] = { "Rec/Play/Overdub", "Stop", "Undo", "Redo", "Clear" };
-    const ml::Command kCommands[LooperProcessor::kNumCommands]     = { ml::Command::Main, ml::Command::Stop, ml::Command::Undo,
-                                                                       ml::Command::Redo, ml::Command::Clear };
-
-    int codeFor (const juce::MidiMessage& m)
-    {
-        if (m.isController())  return 1000 + m.getControllerNumber();
-        if (m.isNoteOn())      return 2000 + m.getNoteNumber();
-        return -1;
-    }
+    // Η σειρά ταιριάζει με τα τρία πετάλια: REC, UNDO, STOP.
+    const char* const kTriggerIds[LooperProcessor::kNumCommands]   = { "trgMain", "trgUndo", "trgStop" };
+    const char* const kTriggerNames[LooperProcessor::kNumCommands] = { "Rec/Play/Overdub", "Undo", "Stop" };
+    const ml::Command kCommands[LooperProcessor::kNumCommands]     = { ml::Command::Main, ml::Command::Undo, ml::Command::Stop };
 }
 
 LooperProcessor::LooperProcessor()
@@ -24,18 +17,22 @@ LooperProcessor::LooperProcessor()
                       ),
       apvts (*this, nullptr, "STATE", createLayout())
 {
-    for (auto& m : mapping) m.store (-1);
-
-    pQuantize     = apvts.getRawParameterValue ("quantize");
+    pQuantize      = apvts.getRawParameterValue ("quantize");
     pStartQuantize = apvts.getRawParameterValue ("startQuantize");
-    pBeatsPerBar  = apvts.getRawParameterValue ("beatsPerBar");
-    pFallbackBpm  = apvts.getRawParameterValue ("fallbackBpm");
-    pAfterRecord  = apvts.getRawParameterValue ("afterRecord");
-    pSyncHost     = apvts.getRawParameterValue ("syncHost");
-    pPassThrough  = apvts.getRawParameterValue ("passThrough");
-    pConsume      = apvts.getRawParameterValue ("consume");
+    pBeatsPerBar   = apvts.getRawParameterValue ("beatsPerBar");
+    pFallbackBpm   = apvts.getRawParameterValue ("fallbackBpm");
+    pAfterRecord   = apvts.getRawParameterValue ("afterRecord");
+    pSyncHost      = apvts.getRawParameterValue ("syncHost");
+    pFollowTempo   = apvts.getRawParameterValue ("followTempo");
+    pSnap          = apvts.getRawParameterValue ("snap");
+    pPassThrough   = apvts.getRawParameterValue ("passThrough");
     for (int i = 0; i < kNumCommands; ++i)
         pTrigger[(size_t) i] = apvts.getRawParameterValue (kTriggerIds[i]);
+
+    for (auto& l : uiLayerLen) l.store (0);
+    snapshot.assign (ml::LooperEngine::kMaxStateBytes, 0);
+    loadBuf.assign (ml::LooperEngine::kMaxStateBytes, 0);
+    restoreBuf.assign (ml::LooperEngine::kMaxStateBytes, 0);
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout LooperProcessor::createLayout()
@@ -44,17 +41,19 @@ juce::AudioProcessorValueTreeState::ParameterLayout LooperProcessor::createLayou
     AudioProcessorValueTreeState::ParameterLayout l;
 
     l.add (std::make_unique<AudioParameterChoice> (ParameterID { "startQuantize", 1 }, "Start Quantize",
-                                                   StringArray { "Off", "Beat", "Bar" }, 0));
+                                                   StringArray { "Off", "Beat", "Bar" }, 1));
     l.add (std::make_unique<AudioParameterChoice> (ParameterID { "quantize", 1 }, "Length Quantize",
-                                                   StringArray { "Off", "Beat", "Bar" }, 0));
+                                                   StringArray { "Off", "Beat", "Bar" }, 2));
+    l.add (std::make_unique<AudioParameterChoice> (ParameterID { "snap", 1 }, "Snap Notes to Grid",
+                                                   StringArray { "Off", "1/8", "1/16" }, 2));
     l.add (std::make_unique<AudioParameterInt> (ParameterID { "beatsPerBar", 1 }, "Beats per Bar", 1, 16, 4));
     l.add (std::make_unique<AudioParameterFloat> (ParameterID { "fallbackBpm", 1 }, "Fallback BPM",
                                                   NormalisableRange<float> (20.0f, 300.0f, 0.1f), 120.0f));
     l.add (std::make_unique<AudioParameterChoice> (ParameterID { "afterRecord", 1 }, "After First Loop",
                                                    StringArray { "Play", "Overdub" }, 0));
-    l.add (std::make_unique<AudioParameterBool> (ParameterID { "syncHost", 1 }, "Sync to Host Transport", false));
+    l.add (std::make_unique<AudioParameterBool> (ParameterID { "syncHost", 1 }, "Sync to Host Transport", true));
+    l.add (std::make_unique<AudioParameterBool> (ParameterID { "followTempo", 1 }, "Follow Tempo", true));
     l.add (std::make_unique<AudioParameterBool> (ParameterID { "passThrough", 1 }, "MIDI Thru", true));
-    l.add (std::make_unique<AudioParameterBool> (ParameterID { "consume", 1 }, "Swallow Mapped Controls", true));
 
     // Κουμπιά αυτοματισμού: κάθε μετάβαση 0 → 1 εκτελεί την εντολή.
     for (int i = 0; i < kNumCommands; ++i)
@@ -72,6 +71,16 @@ void LooperProcessor::prepareToPlay (double sampleRate, int)
     outBuffer.ensureSize (1 << 16);
     lastTrigger.fill (false);
     cmdFifo.reset();
+
+    // Το engine άδειασε: ξαναφόρτωσε τα layers (πρώτα το τελευταίο snapshot, αλλιώς ό,τι ήρθε από το project).
+    {
+        const juce::SpinLock::ScopedLockType a (snapLock);
+        const juce::SpinLock::ScopedLockType b (loadLock);
+        if (snapshotSize > 0)      { std::copy (snapshot.begin(), snapshot.begin() + (std::ptrdiff_t) snapshotSize, loadBuf.begin()); loadSize = snapshotSize; }
+        else if (restoreSize > 0)  { std::copy (restoreBuf.begin(), restoreBuf.begin() + (std::ptrdiff_t) restoreSize, loadBuf.begin()); loadSize = restoreSize; }
+        else                       loadSize = 0;
+        loadPending.store (loadSize > 0);
+    }
 }
 
 bool LooperProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -90,14 +99,6 @@ void LooperProcessor::postCommand (ml::Command c)
     const auto scope = cmdFifo.write (1);
     if (scope.blockSize1 > 0)      cmdSlots[(size_t) scope.startIndex1] = (int) c;
     else if (scope.blockSize2 > 0) cmdSlots[(size_t) scope.startIndex2] = (int) c;
-}
-
-juce::String LooperProcessor::describeMapping (int i) const
-{
-    const int code = mapping[(size_t) i].load();
-    if (code < 0)      return "-";
-    if (code >= 2000)  return "Note " + juce::String (code - 2000);
-    return "CC " + juce::String (code - 1000);
 }
 
 void LooperProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::MidiBuffer& midi)
@@ -124,18 +125,30 @@ void LooperProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::MidiB
         }
 
     ml::Settings st;
-    st.quantize     = (ml::Quantize) juce::jlimit (0, 2, (int) pQuantize->load());
+    st.quantize      = (ml::Quantize) juce::jlimit (0, 2, (int) pQuantize->load());
     st.startQuantize = (ml::Quantize) juce::jlimit (0, 2, (int) pStartQuantize->load());
-    st.beatsPerBar  = (int) pBeatsPerBar->load();
-    st.fallbackBpm  = pFallbackBpm->load();
-    st.afterRecord  = (ml::AfterRecord) juce::jlimit (0, 1, (int) pAfterRecord->load());
-    st.syncToHost   = pSyncHost->load() >= 0.5f;
-    st.passThrough  = pPassThrough->load() >= 0.5f;
-    const bool consume = pConsume->load() >= 0.5f;
+    st.beatsPerBar   = (int) pBeatsPerBar->load();
+    st.fallbackBpm   = pFallbackBpm->load();
+    st.afterRecord   = (ml::AfterRecord) juce::jlimit (0, 1, (int) pAfterRecord->load());
+    st.syncToHost    = pSyncHost->load() >= 0.5f;
+    st.followTempo   = pFollowTempo->load() >= 0.5f;
+    {
+        const int snapIdx = juce::jlimit (0, 2, (int) pSnap->load());
+        st.snapDiv = snapIdx == 1 ? 8 : (snapIdx == 2 ? 16 : 0);
+    }
+    st.passThrough   = pPassThrough->load() >= 0.5f;
 
     inEvents.clear();
     outEvents.clear();
     outBuffer.clear();
+
+    // ---- φόρτωση layers από το project (αν ζητήθηκε) ----
+    if (loadPending.load() && loadLock.tryEnter())
+    {
+        if (loadSize > 0) engine.loadState (loadBuf.data(), loadSize, outEvents);
+        loadPending.store (false);
+        loadLock.exit();
+    }
 
     auto pushCommand = [this] (ml::Command c, int offset)
     {
@@ -164,33 +177,6 @@ void LooperProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::MidiB
     {
         const auto msg = metadata.getMessage();
         const int sample = juce::jlimit (0, juce::jmax (0, numSamples - 1), metadata.samplePosition);
-        const int code = codeFor (msg);
-
-        // MIDI learn
-        const int learning = learnTarget.load();
-        if (learning >= 0 && code >= 0 && (msg.isNoteOn() || (msg.isController() && msg.getControllerValue() > 0 && msg.getControllerNumber() < 120)))
-        {
-            for (auto& m : mapping) if (m.load() == code) m.store (-1);   // ένα χειριστήριο = μία εντολή
-            mapping[(size_t) learning].store (code);
-            learnTarget.store (-1);
-            continue;
-        }
-
-        // χαρτογραφημένο χειριστήριο;
-        bool handled = false;
-        if (code >= 0 || msg.isNoteOff())
-        {
-            const int lookup = msg.isNoteOff() ? 2000 + msg.getNoteNumber() : code;
-            for (int i = 0; i < kNumCommands; ++i)
-            {
-                if (mapping[(size_t) i].load() != lookup) continue;
-                const bool pressed = msg.isNoteOn() || (msg.isController() && msg.getControllerValue() >= 64);
-                if (pressed) pushCommand (kCommands[i], sample);
-                handled = consume;
-                break;
-            }
-        }
-        if (handled) continue;
 
         // sysex και μεγάλα μηνύματα: περνούν απλώς (δεν ηχογραφούνται)
         const int size = msg.getRawDataSize();
@@ -217,12 +203,41 @@ void LooperProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::MidiB
 
     midi.swapWith (outBuffer);
 
+    // ---- snapshot των layers για το project ----
+    if (engine.takeDirty()) snapshotPending = true;
+    if (snapshotPending && snapLock.tryEnter())
+    {
+        snapshotSize = engine.serialize (snapshot.data(), snapshot.size());
+        snapLock.exit();
+        snapshotPending = false;
+    }
+
+    // ---- κατάσταση για το περιβάλλον ----
     uiState.store ((int) engine.getState());
-    uiLayers.store (engine.getLayerCount());
-    uiRedo.store (engine.getRedoCount());
+    const int layers = engine.getLayerCount();
+    uiLayers.store (layers);
+    int mask = 0;
+    for (int i = 0; i < kMaxLayers; ++i)
+    {
+        if (i < layers)
+        {
+            if (engine.isLayerMuted (i)) mask |= (1 << i);
+            uiLayerLen[(size_t) i].store (engine.getLayerLength (i));
+        }
+        else
+            uiLayerLen[(size_t) i].store (0);
+    }
+    uiMuteMask.store (mask);
+    uiPendingTaps.store (engine.getPendingTaps());
     uiPaused.store (engine.isPausedByHost() ? 1 : 0);
     uiPos.store (engine.getPosition());
     uiLength.store (engine.getLength());
+    uiOdStart.store (engine.getOverdubStart());
+    {
+        const double bpm = engine.getRefBpm() > 1.0 ? engine.getRefBpm() : 120.0;
+        const double barQN = info.barLengthQN > 0.0 ? info.barLengthQN : (double) juce::jmax (1, st.beatsPerBar);
+        uiBarSamples.store (60.0 * getSampleRate() / bpm * barQN);
+    }
 }
 
 juce::AudioProcessorEditor* LooperProcessor::createEditor()
@@ -233,8 +248,18 @@ juce::AudioProcessorEditor* LooperProcessor::createEditor()
 void LooperProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     auto state = apvts.copyState();
-    for (int i = 0; i < kNumCommands; ++i)
-        state.setProperty ("map" + juce::String (i), mapping[(size_t) i].load(), nullptr);
+
+    {
+        const juce::SpinLock::ScopedLockType lock (snapLock);
+        if (snapshotSize > 0)
+        {
+            juce::MemoryBlock mb (snapshot.data(), snapshotSize);
+            state.setProperty ("layers", mb.toBase64Encoding(), nullptr);
+        }
+        else
+            state.removeProperty ("layers", nullptr);
+    }
+
     if (auto xml = state.createXml())
         copyXmlToBinary (*xml, destData);
 }
@@ -245,9 +270,29 @@ void LooperProcessor::setStateInformation (const void* data, int sizeInBytes)
         if (xml->hasTagName (apvts.state.getType()))
         {
             auto vt = juce::ValueTree::fromXml (*xml);
-            for (int i = 0; i < kNumCommands; ++i)
-                mapping[(size_t) i].store ((int) vt.getProperty ("map" + juce::String (i), -1));
+            const juce::String layersText = vt.getProperty ("layers").toString();
+            vt.removeProperty ("layers", nullptr);
             apvts.replaceState (vt);
+
+            if (layersText.isNotEmpty())
+            {
+                juce::MemoryBlock mb;
+                if (mb.fromBase64Encoding (layersText)
+                    && mb.getSize() <= ml::LooperEngine::kMaxStateBytes
+                    && ml::LooperEngine::validateState (static_cast<const uint8_t*> (mb.getData()), mb.getSize()))
+                {
+                    const juce::SpinLock::ScopedLockType a (snapLock);
+                    const juce::SpinLock::ScopedLockType b (loadLock);
+                    std::memcpy (restoreBuf.data(), mb.getData(), mb.getSize());
+                    restoreSize = mb.getSize();
+                    std::memcpy (loadBuf.data(), mb.getData(), mb.getSize());
+                    loadSize = mb.getSize();
+                    // το snapshot γίνεται αυτό που φορτώσαμε, ώστε να μη χαθεί αν ξανασωθεί πριν αλλάξει κάτι
+                    std::memcpy (snapshot.data(), mb.getData(), mb.getSize());
+                    snapshotSize = mb.getSize();
+                    loadPending.store (true);
+                }
+            }
         }
 }
 

@@ -3,12 +3,14 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <array>
 #include <atomic>
+#include <vector>
 #include "LooperEngine.h"
 
 class LooperProcessor : public juce::AudioProcessor
 {
 public:
-    static constexpr int kNumCommands = 5;   // Main, Stop, Undo, Redo, Clear
+    static constexpr int kNumCommands = 3;   // Rec/Play/Overdub, Undo, Stop (πολλαπλά πατήματα = layer)
+    static constexpr int kMaxLayers = ml::LooperEngine::kMaxLayers;
 
     LooperProcessor();
     ~LooperProcessor() override = default;
@@ -39,17 +41,14 @@ public:
 
     // --- για το περιβάλλον (message thread) ---
     void postCommand (ml::Command c);                 // κουμπιά της οθόνης
-    void beginLearn (int commandIndex) { learnTarget.store (commandIndex); }
-    void cancelLearn()                 { learnTarget.store (-1); }
-    int  getLearnTarget() const        { return learnTarget.load(); }
-    void clearMapping (int commandIndex) { mapping[(size_t) commandIndex].store (-1); }
-    juce::String describeMapping (int commandIndex) const;
 
     juce::AudioProcessorValueTreeState apvts;
 
     // κατάσταση για εμφάνιση (γράφεται από το audio thread)
-    std::atomic<int> uiState { 0 }, uiLayers { 0 }, uiRedo { 0 }, uiPaused { 0 };
-    std::atomic<int64_t> uiPos { 0 }, uiLength { 0 };
+    std::atomic<int> uiState { 0 }, uiLayers { 0 }, uiPaused { 0 }, uiMuteMask { 0 }, uiPendingTaps { 0 };
+    std::atomic<int64_t> uiPos { 0 }, uiLength { 0 }, uiOdStart { 0 };
+    std::array<std::atomic<int64_t>, kMaxLayers> uiLayerLen;
+    std::atomic<double> uiBarSamples { 96000.0 };   // μήκος μέτρου σε samples αναφοράς
     std::atomic<double> uiSampleRate { 44100.0 };
 
 private:
@@ -64,9 +63,18 @@ private:
     juce::AbstractFifo cmdFifo { 32 };
     std::array<int, 32> cmdSlots {};
 
-    // MIDI learn: κωδικός = είδος*1000 + αριθμός (είδος 1 = CC, 2 = νότα), -1 = τίποτα
-    std::array<std::atomic<int>, kNumCommands> mapping;
-    std::atomic<int> learnTarget { -1 };
+    // αποθήκευση των layers στο project: το audio thread γράφει snapshot όταν κάτι αλλάξει,
+    // και παραλαμβάνει φορτώσεις που ζητά το message thread (χωρίς αναμονή σε κανένα από τα δύο)
+    juce::SpinLock snapLock;
+    std::vector<uint8_t> snapshot;
+    size_t snapshotSize = 0;
+    bool snapshotPending = false;           // μόνο audio thread
+    juce::SpinLock loadLock;
+    std::vector<uint8_t> loadBuf;
+    size_t loadSize = 0;
+    std::atomic<bool> loadPending { false };
+    std::vector<uint8_t> restoreBuf;        // τελευταία κατάσταση που φορτώθηκε από το project (message thread)
+    size_t restoreSize = 0;
 
     // παράμετροι
     std::atomic<float>* pQuantize = nullptr;
@@ -75,8 +83,9 @@ private:
     std::atomic<float>* pFallbackBpm = nullptr;
     std::atomic<float>* pAfterRecord = nullptr;
     std::atomic<float>* pSyncHost = nullptr;
+    std::atomic<float>* pFollowTempo = nullptr;
+    std::atomic<float>* pSnap = nullptr;
     std::atomic<float>* pPassThrough = nullptr;
-    std::atomic<float>* pConsume = nullptr;
     std::array<std::atomic<float>*, kNumCommands> pTrigger {};
     std::array<bool, kNumCommands> lastTrigger {};
 

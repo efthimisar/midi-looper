@@ -2,7 +2,13 @@
 
 #include "PluginProcessor.h"
 
-// Εμφάνιση: ανοιχτό γκρι σώμα, μαύρο πάνελ, τρία μεγάλα πετάλια.
+// Σύμβολα που ζωγραφίζονται με διανύσματα (χωρίς εικόνες ή γραμματοσειρές εικονιδίων).
+enum class Symbol { PadRecord, PadOverdub, Play, Stop, Cancel, Undo,
+                    StartQ, LengthQ, Snap, Loop, Sync, Tempo, Thru };
+
+void drawSymbol (juce::Graphics&, Symbol, juce::Point<float> centre, float size, juce::Colour);
+
+// Εμφάνιση: κρεμ σώμα, σκούρο πάνελ, τρία λευκά πετάλια με φωτισμό μέσα τους, παστέλ χρώματα.
 class LooperLookAndFeel : public juce::LookAndFeel_V4
 {
 public:
@@ -28,31 +34,31 @@ public:
 
 private:
     void timerCallback() override;
-    void drawLed (juce::Graphics&, juce::Point<float> centre, juce::Colour colour, bool lit) const;
-
-    enum class Icon { Record, Play, Stop, Overdub, Cancel, Redo, Undo, Clear };
-    void drawIcon (juce::Graphics&, Icon, juce::Point<float> centre, float size, juce::Colour) const;
+    void drawLanes (juce::Graphics&) const;
 
     LooperLookAndFeel laf;   // πρέπει να δηλωθεί πρώτο: καταστρέφεται τελευταίο
     LooperProcessor& proc;
+    juce::TooltipWindow tooltip { this, 700 };
 
     juce::Label statusLabel;
-    std::array<juce::TextButton, LooperProcessor::kNumCommands> cmdButtons;   // REC, STOP, UNDO, REDO, CLEAR (τα UNDO/CLEAR δεν εμφανίζονται)
+    std::array<juce::TextButton, LooperProcessor::kNumCommands> pads;   // REC, UNDO, STOP
 
-    juce::Label startLabel, quantizeLabel, afterLabel;
-    juce::ComboBox startBox, quantizeBox, afterBox;
-    juce::ToggleButton syncToggle, thruToggle;
+    juce::ComboBox startBox, quantizeBox, snapBox, afterBox;
+    juce::ToggleButton syncToggle, tempoToggle, thruToggle;
 
     using Combo  = juce::AudioProcessorValueTreeState::ComboBoxAttachment;
     using Button = juce::AudioProcessorValueTreeState::ButtonAttachment;
-    std::unique_ptr<Combo> startAtt, quantizeAtt, afterAtt;
-    std::unique_ptr<Button> syncAtt, thruAtt;
+    std::unique_ptr<Combo> startAtt, quantizeAtt, snapAtt, afterAtt;
+    std::unique_ptr<Button> syncAtt, tempoAtt, thruAtt;
 
-    juce::Rectangle<int> progressArea;
-    float progress = 0.0f;
-    int shownState = -1;
-    int shownRedo = -1;
-    Icon mainIcon = Icon::Record;   // τι κάνει το επόμενο πάτημα του REC
+    // στιγμιότυπο της κατάστασης για ζωγράφισμα
+    struct Shown
+    {
+        int state = 0, layers = 0, muteMask = 0;
+        std::array<int64_t, LooperProcessor::kMaxLayers> layerLen {};
+        int64_t length = 0, pos = 0, odStart = 0;
+        double barSamples = 96000.0;
+    } shown;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (LooperEditor)
 };

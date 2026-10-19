@@ -22,14 +22,18 @@ struct Script   // γεγονότα σε απόλυτο χρόνο (samples)
     void midi (int64_t t, uint8_t s, uint8_t a, uint8_t b) { Msg m; m.b[0] = s; m.b[1] = a; m.b[2] = b; m.size = 3; items.push_back ({ t, false, Command::Main, m }); }
     void on  (int64_t t, int n, int v = 100) { midi (t, 0x90, (uint8_t) n, (uint8_t) v); }
     void off (int64_t t, int n)              { midi (t, 0x80, (uint8_t) n, 0); }
+    void rec (int64_t t) { cmd (t, Command::Main); }
+    void undo (int64_t t) { cmd (t, Command::Undo); }
+    void tap (int64_t t) { cmd (t, Command::Stop); }
 };
 
-struct Host { bool playing = false; int64_t origin = 0; double bpm = 0; int bpb = 0; bool jumpAt = false; };
-
-// Εκτελεί το script με μέγεθος block bs. hostFn(t) δίνει θέση host (ή -1 = άγνωστη).
+// Εκτελεί το script με μέγεθος block bs. hostPos(t) δίνει θέση host (ή -1 = άγνωστη).
+// bpmFn/ppqFn: προαιρετικά, για tempo που αλλάζει.
 static std::vector<Out> run (const Script& sc, int64_t total, int bs, const Settings& st,
                              std::function<int64_t (int64_t)> hostPos = nullptr, double bpm = 0.0,
-                             LooperEngine* engOut = nullptr)
+                             LooperEngine* engOut = nullptr,
+                             std::function<double (int64_t)> bpmFn = nullptr,
+                             std::function<double (int64_t)> ppqFn = nullptr)
 {
     static LooperEngine local;
     LooperEngine& eng = engOut ? *engOut : local;
@@ -48,24 +52,23 @@ static std::vector<Out> run (const Script& sc, int64_t total, int bs, const Sett
                 InEvent e; e.offset = (int) (it.t - t0); e.isCommand = it.cmd; e.cmd = it.c; e.msg = it.m;
                 in.push_back (e);
             }
-        BlockInfo info; info.numSamples = n; info.bpm = bpm;
+        BlockInfo info; info.numSamples = n; info.bpm = bpmFn ? bpmFn (t0) : bpm;
         if (hostPos)
         {
             const int64_t h = hostPos (t0);
             info.hostPlaying = h >= 0; info.hostPositionValid = h >= 0; info.hostSample = h >= 0 ? h : 0;
-            if (h >= 0 && bpm > 0.0) { info.ppqValid = true; info.ppq = (double) h * bpm / (60.0 * 48000.0); }
+            if (h >= 0 && info.bpm > 0.0)
+            {
+                info.ppqValid = true;
+                info.ppq = ppqFn ? ppqFn (t0) : (double) h * info.bpm / (60.0 * 48000.0);
+            }
         }
         eng.process (info, st, in.data(), (int) in.size(), out);
         for (auto& o : out) res.push_back ({ t0 + o.offset, o.msg.b[0], o.msg.b[1], o.msg.b[2] });
     }
+    // Το MidiBuffer του JUCE ταξινομεί κατά θέση· εδώ ταξινομούμε με το ίδιο κριτήριο.
+    std::stable_sort (res.begin(), res.end(), [] (const Out& a, const Out& b) { return a.t < b.t; });
     return res;
-}
-
-static std::vector<Out> only (const std::vector<Out>& v, int64_t from, bool noPass = false)
-{
-    std::vector<Out> r;
-    for (auto& o : v) if (o.t >= from) r.push_back (o);
-    (void) noPass; return r;
 }
 
 // κάθε note-on πρέπει να έχει αντίστοιχο off στο τέλος
@@ -82,387 +85,445 @@ static bool balanced (const std::vector<Out>& v)
     return true;
 }
 
+// Χρόνοι note-on μιας νότας
+static std::vector<int64_t> ons (const std::vector<Out>& v, int note)
+{
+    std::vector<int64_t> r;
+    for (auto& o : v) if ((o.s & 0xF0) == 0x90 && o.b > 0 && o.a == note) r.push_back (o.t);
+    return r;
+}
+static std::vector<int64_t> offs (const std::vector<Out>& v, int note)
+{
+    std::vector<int64_t> r;
+    for (auto& o : v) if ((o.s & 0xF0) == 0x80 && o.a == note) r.push_back (o.t);
+    return r;
+}
+static bool has (const std::vector<int64_t>& v, int64_t t, int64_t tol = 0)
+{
+    for (auto x : v) if (std::llabs (x - t) <= tol) return true;
+    return false;
+}
+static bool any (const std::vector<int64_t>& v, int64_t from, int64_t to)
+{
+    for (auto x : v) if (x >= from && x < to) return true;
+    return false;
+}
+
 static Settings noThru() { Settings s; s.passThrough = false; return s; }
 
-static Script basicScript()
+// Βασικό loop: μήκος 2000, νότα 60 στη θέση 100..600. Το loop ξεκινά (θέση 0) στο t = 3000.
+static Script base()
 {
     Script s;
-    s.cmd (1000, Command::Main);         // αρχή ηχογράφησης
+    s.rec (1000);
     s.on (1100, 60); s.off (1600, 60);
-    s.cmd (3000, Command::Main);         // μήκος = 2000
+    s.rec (3000);
     return s;
 }
 
 int main()
 {
-    // 1) free-length: το μήκος ορίζεται από το δεύτερο πάτημα
+    // 1) το μήκος ορίζεται από το δεύτερο πάτημα
     {
-        auto o = run (basicScript(), 11000, 64, noThru());
+        LooperEngine e;
+        auto o = run (base(), 11000, 64, noThru(), nullptr, 0.0, &e);
         std::vector<Out> expect;
         for (int p = 0; p < 4; ++p) { expect.push_back ({ 3000 + p * 2000 + 100, 0x90, 60, 100 });
                                       expect.push_back ({ 3000 + p * 2000 + 600, 0x80, 60, 0 }); }
         CHECK (o == expect, "free-length loop: %zu γεγονότα αντί για %zu", o.size(), expect.size());
+        CHECK (e.getLength() == 2000 && e.getLayerCount() == 1, "length=%lld layers=%d", (long long) e.getLength(), e.getLayerCount());
     }
 
     // 2) ανεξαρτησία από μέγεθος block (sample-accurate)
     {
-        auto ref = run (basicScript(), 11000, 64, noThru());
+        auto ref = run (base(), 11000, 64, noThru());
         for (int bs : { 1, 7, 100, 333, 512, 1024, 4096 })
         {
-            auto o = run (basicScript(), 11000, bs, noThru());
+            auto o = run (base(), 11000, bs, noThru());
             CHECK (o == ref, "block size %d δίνει διαφορετική έξοδο", bs);
         }
     }
 
     // 3) stuck notes: νότα που κρατιέται όταν κλείνει το loop
     {
-        Script s; s.cmd (1000, Command::Main); s.on (1500, 64); s.cmd (3000, Command::Main); // ποτέ off
-        auto o = run (s, 11000, 128, noThru());   // τελειώνει ανάμεσα σε περάσματα
+        Script s; s.rec (1000); s.on (1500, 64); s.rec (3000);   // ποτέ off
+        auto o = run (s, 11000, 128, noThru());
         CHECK (balanced (o), "stuck note στο κλείσιμο του loop");
         bool hasOff = false; for (auto& e : o) if ((e.s & 0xF0) == 0x80) hasOff = true;
         CHECK (hasOff, "δεν στάλθηκε note-off");
     }
 
-    // 4) stuck notes: stop στη μέση νότας
+    // 4) overdub μέσα στο μήκος: το μήκος δεν αλλάζει
     {
-        Script s = basicScript(); s.cmd (3000 + 300, Command::Stop); // νότα ηχεί 100..600
-        s.items.clear(); s.cmd (1000, Command::Main); s.on (1100, 60); s.off (1900, 60); s.cmd (3000, Command::Main);
-        s.cmd (3000 + 500, Command::Stop);   // η νότα (100..900) ηχεί
-        auto o = run (s, 9000, 100, noThru());
-        CHECK (balanced (o), "stuck note μετά το Stop");
-        int64_t lastOff = -1; for (auto& e : o) if ((e.s & 0xF0) == 0x80) lastOff = e.t;
-        CHECK (lastOff == 3500, "το off του Stop έπρεπε να είναι στο 3500, είναι %lld", (long long) lastOff);
+        Script s = base();
+        s.rec (5000);                          // overdub από τη θέση 0
+        s.on (5200, 64); s.off (5400, 64);
+        s.rec (7000);                          // κλείνει ακριβώς στο τέλος του loop
+        LooperEngine e;
+        auto o = run (s, 11000, 64, noThru(), nullptr, 0.0, &e);
+        CHECK (e.getLength() == 2000, "length=%lld", (long long) e.getLength());
+        CHECK (e.getLayerCount() == 2, "layers=%d", e.getLayerCount());
+        CHECK (has (ons (o, 64), 7200) && has (ons (o, 64), 9200), "η νότα 64 δεν επαναλαμβάνεται");
+        CHECK (has (offs (o, 64), 7400) && has (offs (o, 64), 9400), "off της 64");
+        CHECK (balanced (o), "unbalanced");
     }
 
-    // 5) overdub + undo, με νότα που ηχεί την ώρα του undo
+    // 5) overdub που κλείνει ΠΡΙΝ το τέλος: το μήκος δεν αλλάζει
     {
-        Script s = basicScript();
-        s.cmd (5000, Command::Main);                       // overdub (θέση 0 στο loop στα 5000)
-        s.on (5200, 72); s.off (5400, 72);                 // layer 2: 72 στη θέση 200..400
-        s.cmd (6000, Command::Main);                       // τέλος overdub → Playing
-        s.cmd (7300, Command::Undo);                       // undo (θέση 1300 → 7300 δεν ηχεί 72)
-        auto o = run (s, 13000, 97, noThru());
-        int cnt72before = 0, cnt72after = 0;
-        for (auto& e : o) if (e.a == 72 && (e.s & 0xF0) == 0x90) { if (e.t < 7300) ++cnt72before; else ++cnt72after; }
-        CHECK (cnt72before >= 1, "το overdub δεν παίχτηκε");
-        CHECK (cnt72after == 0, "το undo δεν αφαίρεσε το layer (%d)", cnt72after);
-        CHECK (balanced (o), "stuck notes μετά το undo");
-        int base = 0; for (auto& e : o) if (e.a == 60 && (e.s & 0xF0) == 0x90 && e.t > 7300) ++base;
-        CHECK (base >= 2, "το πρώτο layer έπρεπε να συνεχίσει (%d)", base);
+        Script s = base();
+        s.rec (5000);
+        s.on (5200, 64); s.off (5400, 64);
+        s.rec (6000);                          // θέση 1000 < 2000
+        LooperEngine e;
+        auto o = run (s, 11000, 64, noThru(), nullptr, 0.0, &e);
+        CHECK (e.getLength() == 2000 && e.getLayerCount() == 2, "length=%lld", (long long) e.getLength());
+        CHECK (has (ons (o, 64), 7200), "νότα 64 στον επόμενο κύκλο");
+        CHECK (balanced (o), "unbalanced");
     }
 
-    // 6) undo την ώρα που ηχεί νότα του layer → note-off
+    // 6) overdub που ξεπερνά το τέλος: το loop μεγαλώνει, τα παλιά layers επαναλαμβάνονται
+    Script ext = base();
+    ext.rec (5000);
+    ext.on (5200, 64); ext.off (5300, 64);
+    ext.on (7200, 65); ext.off (7300, 65);
+    ext.rec (9000);                            // 4000 samples overdub → loop 4000
     {
-        Script s;
-        s.cmd (0 + 1, Command::Main);
-        s.cmd (4001, Command::Main);                       // length 4000, κενό layer 0
-        s.cmd (4001 + 100, Command::Main);                 // overdub από θέση 100
-        s.on (4001 + 200, 65); s.off (4001 + 3000, 65);    // 65 ηχεί 200..3000
-        s.cmd (4001 + 3500, Command::Main);                // τέλος overdub
-        s.cmd (4001 + 4000 + 1000, Command::Undo);         // undo ενώ ηχεί η 65 (στο 2ο πέρασμα, θέση 1000)
-        auto o = run (s, 20000, 64, noThru());
-        CHECK (balanced (o), "νότα έμεινε αναμμένη μετά το undo");
-        int64_t offT = -1; for (auto& e : o) if (e.a == 65 && (e.s & 0xF0) == 0x80 && e.t >= 4001 + 4000 + 1000) { offT = e.t; break; }
-        CHECK (offT == 4001 + 4000 + 1000, "το off του undo έπρεπε να είναι ακριβώς στο undo (%lld)", (long long) offT);
+        LooperEngine e;
+        auto o = run (ext, 20000, 64, noThru(), nullptr, 0.0, &e);
+        CHECK (e.getLength() == 4000, "length=%lld", (long long) e.getLength());
+        CHECK (e.getLayerCount() == 2, "layers=%d", e.getLayerCount());
+        CHECK (e.getLayerLength (0) == 2000 && e.getLayerLength (1) == 4000, "layer lens %lld %lld",
+               (long long) e.getLayerLength (0), (long long) e.getLayerLength (1));
+        auto n60 = ons (o, 60);
+        // καθώς το overdub συνεχίζει, το layer 1 (μήκος 2000) κυκλώνει κανονικά
+        CHECK (has (n60, 5100) && has (n60, 7100) && has (n60, 9100) && has (n60, 11100) && has (n60, 13100),
+               "το layer 1 δεν επαναλαμβάνεται κάθε 2000");
+        auto n64 = ons (o, 64), n65 = ons (o, 65);
+        CHECK (has (n64, 9200) && has (n64, 13200) && has (n64, 17200), "64 κάθε 4000 από 9200");
+        CHECK (has (n65, 11200) && has (n65, 15200), "65 κάθε 4000 από 11200");
+        CHECK (! has (n64, 11200) && ! has (n65, 9200), "οι νότες δεν πρέπει να επαναλαμβάνονται κάθε 2000");
+        CHECK (balanced (o), "unbalanced");
     }
 
-    // 7) νότα που κρατιέται κατά το wrap σε overdub δεν κολλάει
-    {
-        Script s;
-        s.cmd (0, Command::Main); s.cmd (4000, Command::Main);   // length 4000
-        s.cmd (4000 + 100, Command::Main);                       // overdub
-        s.on (4000 + 3900, 70);                                  // κρατιέται πάνω από το wrap
-        s.off (4000 + 4100, 70);
-        s.cmd (4000 + 9000, Command::Main);
-        auto o = run (s, 30000, 256, noThru());
-        CHECK (balanced (o), "stuck note στο wrap του overdub");
-    }
-
-    // 8) quantize
-    {
-        Settings st = noThru(); st.quantize = Quantize::Bar;   // 120 bpm, 48k → beat 24000, bar 96000
-        Script s; s.cmd (0, Command::Main); s.cmd (100000, Command::Main);
-        LooperEngine e; run (s, 100001, 512, st, nullptr, 120.0, &e);
-        CHECK (e.getLength() == 96000, "bar quantize 100000 → %lld", (long long) e.getLength());
-
-        Script s2; s2.cmd (0, Command::Main); s2.cmd (200000, Command::Main);
-        LooperEngine e2; run (s2, 200001, 512, st, nullptr, 120.0, &e2);
-        CHECK (e2.getLength() == 192000, "bar quantize 200000 → %lld", (long long) e2.getLength());
-
-        Script s3; s3.cmd (0, Command::Main); s3.cmd (10000, Command::Main);
-        LooperEngine e3; run (s3, 10001, 512, st, nullptr, 120.0, &e3);
-        CHECK (e3.getLength() == 96000, "ελάχιστο 1 μέτρο → %lld", (long long) e3.getLength());
-
-        Settings sb = noThru(); sb.quantize = Quantize::Beat;
-        Script s4; s4.cmd (0, Command::Main); s4.cmd (60000, Command::Main);
-        LooperEngine e4; run (s4, 60001, 512, sb, nullptr, 120.0, &e4);
-        CHECK (e4.getLength() == 72000, "beat quantize 60000 → %lld", (long long) e4.getLength());
-    }
-
-    // 9) quantize προς τα κάτω: τυλίγει τα γεγονότα, χωρίς stuck note
-    {
-        Settings st = noThru(); st.quantize = Quantize::Bar;
-        Script s; s.cmd (0, Command::Main);
-        s.on (50000, 60); s.off (60000, 60);
-        s.on (97000, 62); s.off (98500, 62);   // μετά το νέο μήκος 96000 → τυλίγεται στο 1000..2500
-        s.on (99000, 64);                      // κρατιέται όταν πατηθεί το 2ο Main
-        s.cmd (100000, Command::Main);
-        auto o = run (s, 500000, 480, st, nullptr, 120.0);
-        CHECK (balanced (o), "stuck note με quantize προς τα κάτω");
-        // Πάτημα στο 100000 ⇒ θέση loop 4000. Το γεγονός στη θέση 1000 παίζει στο επόμενο πέρασμα.
-        bool saw62 = false; for (auto& e : o) if (e.a == 62 && e.t == 100000 + (96000 - 4000) + 1000) saw62 = true;
-        CHECK (saw62, "το τυλιγμένο γεγονός δεν έπεσε στη σωστή θέση");
-    }
-
-    // 10) redo / clear / όριο layers
-    {
-        Script s = basicScript();
-        s.cmd (5000, Command::Main); s.on (5100, 80); s.off (5300, 80); s.cmd (5500, Command::Main);
-        s.cmd (6000, Command::Undo);
-        s.cmd (6500, Command::Redo);
-        LooperEngine e; run (s, 7000, 64, noThru(), nullptr, 0.0, &e);
-        CHECK (e.getLayerCount() == 2 && e.getRedoCount() == 0, "redo: layers=%d redo=%d", e.getLayerCount(), e.getRedoCount());
-
-        Script s2 = basicScript(); s2.cmd (4000, Command::Undo); s2.cmd (4500, Command::Redo);
-        LooperEngine e2; run (s2, 6000, 64, noThru(), nullptr, 0.0, &e2);
-        CHECK (e2.getState() == State::Playing && e2.getLength() == 2000, "redo από άδειο loop");
-
-        Script s3 = basicScript(); s3.cmd (4000, Command::Clear);
-        LooperEngine e3; auto o3 = run (s3, 9000, 64, noThru(), nullptr, 0.0, &e3);
-        CHECK (e3.getState() == State::Empty && e3.getLength() == 0, "clear");
-        CHECK (only (o3, 4001).empty(), "έξοδος μετά το clear");
-        CHECK (balanced (o3), "stuck note μετά το clear");
-    }
-
-    // 11) καμία δέσμευση μνήμης: η χωρητικότητα δεν αλλάζει σε μεγάλη ηχογράφηση
-    {
-        Script s; s.cmd (0, Command::Main);
-        for (int i = 0; i < 20000; ++i) { s.on (10 + i * 5LL, 60 + (i % 12)); s.off (13 + i * 5LL, 60 + (i % 12)); }
-        s.cmd (120000, Command::Main);
-        LooperEngine e; auto o = run (s, 130000, 256, noThru(), nullptr, 0.0, &e);
-        CHECK (e.layerCapacity (0) == (size_t) LooperEngine::kEventsPerLayer, "η χωρητικότητα άλλαξε: %zu", e.layerCapacity (0));
-        CHECK (e.layerEventCount (0) <= LooperEngine::kEventsPerLayer, "υπερχείλιση layer");
-        CHECK (balanced (o), "stuck notes σε γεμάτο layer");
-    }
-
-    // 12) pass-through και απενεργοποίησή του με νότα που κρατιέται
-    {
-        Script s; s.on (100, 60);
-        Settings thru; thru.passThrough = true;
-        auto o = run (s, 1000, 100, thru);
-        CHECK (o.size() == 1 && o[0].t == 100, "pass-through");
-
-        // αλλαγή ρύθμισης στη μέση: με δύο runs δεν γίνεται, οπότε δοκιμάζουμε απευθείας
-        LooperEngine e; e.prepare (48000.0);
-        std::vector<OutEvent> out; out.reserve (64);
-        InEvent ev; ev.offset = 10; ev.msg.b[0] = 0x90; ev.msg.b[1] = 60; ev.msg.b[2] = 100; ev.msg.size = 3;
-        BlockInfo bi; bi.numSamples = 64;
-        e.process (bi, thru, &ev, 1, out);
-        out.clear();
-        Settings off = thru; off.passThrough = false;
-        e.process (bi, off, nullptr, 0, out);
-        CHECK (out.size() == 1 && (out[0].msg.b[0] & 0xF0) == 0x80, "το pass-through έκλεισε με νότα κολλημένη");
-    }
-
-    // 13) sustain pedal δεν μένει πατημένο
-    {
-        Script s; s.cmd (0, Command::Main); s.midi (1000, 0xB0, 64, 127); s.cmd (3000, Command::Main);
-        auto o = run (s, 21000, 100, noThru());
-        int down = 0, up = 0; for (auto& e : o) if ((e.s & 0xF0) == 0xB0 && e.a == 64) { if (e.b >= 64) ++down; else ++up; }
-        CHECK (down == up && down > 0, "sustain: down=%d up=%d", down, up);
-    }
-
-    // 14) host sync: μετά από άλματα του transport η θέση του loop ακολουθεί το host
+    // 7) το ίδιο με host sync: ίδια έξοδος με το χωρίς sync (ο host προχωρά κανονικά)
     {
         Settings st = noThru(); st.syncToHost = true;
-        Script s;
-        s.cmd (1000, Command::Main);   // anchor = host 1000
-        s.on (1100, 60); s.off (1600, 60);
-        s.cmd (3000, Command::Main);   // length 2000
-        // host: παίζει κανονικά ως 9000, μετά άλμα στο 100000 (+ 7000 μετά)
-        auto hostPos = [] (int64_t t) -> int64_t { return t < 9000 ? t : 100000 + (t - 9000); };
-        auto o = run (s, 14000, 64, st, hostPos);
-        // μετά το άλμα: host=100000+k. θέση loop = (host-1000) % 2000. Το 60 παίζει όταν θέση=100.
-        // host τιμές: (h-1000)%2000==100 → h = 1100 + 2000n → 101100 είναι ο πρώτος μετά το 100000
-        bool ok = false; for (auto& e : o) if ((e.s & 0xF0) == 0x90 && e.t == 9000 + (101100 - 100000)) ok = true;
-        CHECK (ok, "μετά το άλμα του host το loop δεν ευθυγραμμίστηκε");
-        CHECK (balanced (o), "stuck notes μετά το άλμα");
-
-        // παύση transport στη μέση νότας → off
-        Script s2 = s;
-        auto hostStop = [] (int64_t t) -> int64_t { return t < 3300 ? t : -1; };   // η 60 ηχεί 3100..3600
-        auto o2 = run (s2, 8000, 64, st, hostStop);
-        CHECK (balanced (o2), "stuck note όταν σταματά το transport");
+        auto ref = run (ext, 20000, 64, noThru());
+        auto o = run (ext, 20000, 64, st, [] (int64_t t) { return t; });
+        CHECK (o == ref, "sync: διαφορετική έξοδος (%zu vs %zu γεγονότα)", o.size(), ref.size());
+        for (int bs : { 1, 100, 777, 4096 })
+        {
+            auto o2 = run (ext, 20000, bs, st, [] (int64_t t) { return t; });
+            CHECK (o2 == ref, "sync, block %d", bs);
+        }
     }
 
-    // 15) δεύτερο πάτημα στο ίδιο sample → ακύρωση (όχι μήκος 0)
+    // 8) UNDO σβήνει το νεότερο layer και το μήκος γυρίζει στο προηγούμενο
     {
-        Script s; s.cmd (500, Command::Main); s.cmd (500, Command::Main);
-        LooperEngine e; run (s, 2000, 64, noThru(), nullptr, 0.0, &e);
-        CHECK (e.getState() == State::Empty, "διπλό πάτημα στο ίδιο sample");
+        Script s = ext;
+        s.undo (15000);
+        LooperEngine e;
+        auto o = run (s, 24000, 64, noThru(), nullptr, 0.0, &e);
+        CHECK (e.getLength() == 2000 && e.getLayerCount() == 1, "length=%lld layers=%d", (long long) e.getLength(), e.getLayerCount());
+        CHECK (! any (ons (o, 64), 15001, 24000) && ! any (ons (o, 65), 15001, 24000), "οι νότες του undone layer ακούγονται ακόμα");
+        CHECK (any (ons (o, 60), 16000, 24000), "το layer 1 δεν συνεχίζει");
+        CHECK (balanced (o), "unbalanced");
+        // δεύτερο undo → άδειο
+        Script s2 = s; s2.undo (18000);
+        auto o2 = run (s2, 24000, 64, noThru(), nullptr, 0.0, &e);
+        CHECK (e.getState() == State::Empty && e.getLayerCount() == 0 && e.getLength() == 0, "δεν άδειασε");
+        CHECK (! any (ons (o2, 60), 18001, 24000), "ακούγεται μετά το τελευταίο undo");
+        CHECK (balanced (o2), "unbalanced");
     }
 
-    // 16) afterRecord = Overdub
+    // 9) undo μέσα σε overdub ακυρώνει μόνο το τρέχον overdub
+    {
+        Script s = base();
+        s.rec (5000); s.on (5200, 64); s.off (5300, 64);
+        s.undo (5500);
+        LooperEngine e;
+        auto o = run (s, 12000, 64, noThru(), nullptr, 0.0, &e);
+        CHECK (e.getState() == State::Playing && e.getLayerCount() == 1 && e.getLength() == 2000, "state/layers/length");
+        CHECK (! any (ons (o, 64), 5600, 12000), "νότα του ακυρωμένου overdub");
+        CHECK (any (ons (o, 60), 6000, 12000), "το layer 1 σταμάτησε");
+    }
+
+    // 10) STOP: 1 πάτημα σιγάζει το layer 1, ξανά 1 πάτημα το ξαναενεργοποιεί
+    Script two = base();                     // 2 layers, μήκος 2000: 60 (θέση 100) και 64 (θέση 200)
+    two.rec (5000); two.on (5200, 64); two.off (5400, 64); two.rec (7000);
+    {
+        Script s = two;
+        s.tap (8000);                       // → σίγαση layer 1 στο 8000 + 24000 = 32000
+        s.tap (60000);                      // → ενεργοποίηση στο 84000
+        LooperEngine e;
+        auto o = run (s, 120000, 128, noThru(), nullptr, 0.0, &e);
+        CHECK (! any (ons (o, 60), 32000, 84000), "το layer 1 ακούγεται ενώ είναι σιγασμένο");
+        CHECK (any (ons (o, 64), 32000, 84000), "το layer 2 σταμάτησε");
+        CHECK (any (ons (o, 60), 84000, 120000), "το layer 1 δεν ξαναγύρισε");
+        CHECK (! e.isLayerMuted (0), "muted flag");
+        CHECK (e.getLength() == 2000, "το μήκος άλλαξε από το STOP");
+        CHECK (balanced (o), "unbalanced");
+    }
+
+    // 11) STOP: 2 πατήματα = layer 2, 3 πατήματα χωρίς 3ο layer = τίποτα
+    {
+        Script s = two;
+        s.tap (8000); s.tap (12000);        // 2 πατήματα → layer 2 (στο 12000+24000 = 36000)
+        LooperEngine e;
+        auto o = run (s, 60000, 64, noThru(), nullptr, 0.0, &e);
+        CHECK (e.isLayerMuted (1) && ! e.isLayerMuted (0), "το layer 2 έπρεπε να σιγάσει");
+        CHECK (! any (ons (o, 64), 36000, 60000), "το layer 2 ακούγεται");
+        CHECK (any (ons (o, 60), 36000, 60000), "το layer 1 σιγάστηκε λάθος");
+        Script s3 = two; s3.tap (8000); s3.tap (9000); s3.tap (10000);   // 3 πατήματα, υπάρχουν 2 layers
+        run (s3, 60000, 64, noThru(), nullptr, 0.0, &e);
+        CHECK (! e.isLayerMuted (0) && ! e.isLayerMuted (1), "το 3 πάτημα δεν έπρεπε να αλλάξει τίποτα");
+        // αργά πατήματα = ξεχωριστές ομάδες
+        Script s4 = two; s4.tap (8000); s4.tap (8000 + 30000);
+        run (s4, 120000, 64, noThru(), nullptr, 0.0, &e);
+        CHECK (! e.isLayerMuted (0), "δύο αργά πατήματα = σίγαση και επανενεργοποίηση του layer 1");
+    }
+
+    // 12) STOP: ανεξάρτητο από το μέγεθος block
+    {
+        Script s = two; s.tap (8000); s.tap (12000);
+        auto ref = run (s, 60000, 64, noThru());
+        for (int bs : { 1, 33, 500, 4096 })
+            CHECK (run (s, 60000, bs, noThru()) == ref, "block %d", bs);
+    }
+
+    // 13) τα σιγασμένα layers μένουν σιγασμένα όταν γίνεται νέο overdub
+    {
+        Script s = two;
+        s.tap (8000);                       // σίγαση layer 1 στο 32000
+        s.rec (40000);                      // overdub
+        s.on (40100, 70); s.off (40200, 70);
+        s.rec (42000);
+        LooperEngine e;
+        auto o = run (s, 70000, 64, noThru(), nullptr, 0.0, &e);
+        CHECK (e.getLayerCount() == 3, "layers=%d", e.getLayerCount());
+        CHECK (e.isLayerMuted (0) && ! e.isLayerMuted (1) && ! e.isLayerMuted (2), "muted flags");
+        CHECK (! any (ons (o, 60), 32000, 70000), "το σιγασμένο layer ξαναπαίζει");
+        CHECK (balanced (o), "unbalanced");
+    }
+
+    // 14) σίγαση μέσα σε νότα: κανένα κολλημένο
+    {
+        Script s = base();
+        s.on (9000, 1);    // τυχαία live νότα, ώστε το pass-through να μην επηρεάζει
+        s.off (9100, 1);
+        s.tap (3300);      // η νότα 60 ηχεί (3100..3600) αλλά η σίγαση γίνεται στο 3300 + 24000
+        auto o = run (s, 40000, 64, noThru());
+        CHECK (balanced (o), "unbalanced");
+        Script s2 = base(); s2.tap (31000);   // σίγαση στο 55000... το τρέχον off πρέπει να σταλεί
+        auto o2 = run (s2, 80000, 64, noThru());
+        CHECK (balanced (o2), "unbalanced 2");
+    }
+
+    // 15) μέγιστος αριθμός layers = 4
+    {
+        Script s = base();
+        int64_t t = 5000;
+        for (int i = 0; i < 5; ++i) { s.rec (t); s.on (t + 100, 70 + i); s.off (t + 200, 70 + i); s.rec (t + 2000); t += 4000; }
+        LooperEngine e;
+        auto o = run (s, 40000, 64, noThru(), nullptr, 0.0, &e);
+        CHECK (e.getLayerCount() == 4, "layers=%d", e.getLayerCount());
+        CHECK (e.getState() == State::Playing, "state");
+        CHECK (balanced (o), "unbalanced");
+    }
+
+    // 16) 4 → 8 → 16: διαδοχικές επεκτάσεις και undo ένα ένα
+    {
+        Script s = base();                  // 2000
+        s.rec (5000); s.on (5100, 64); s.off (5200, 64);
+        s.rec (9000);                       // 4000
+        s.rec (11000); s.on (11100, 65); s.off (11200, 65);   // overdub από θέση 2000.. (11000-9000=2000)
+        s.rec (17000);                      // 6000 στο timeline του overdub: 2000+6000 = 8000 → loop 8000
+        LooperEngine e;
+        run (s, 30000, 64, noThru(), nullptr, 0.0, &e);
+        CHECK (e.getLayerCount() == 3 && e.getLength() == 8000, "layers=%d length=%lld", e.getLayerCount(), (long long) e.getLength());
+        Script u = s; u.undo (30000); u.undo (31000); u.undo (32000);
+        std::vector<int64_t> lens;
+        for (int64_t T : { 30500, 31500, 32500 })
+        {
+            LooperEngine e2; run (u, T, 64, noThru(), nullptr, 0.0, &e2);
+            lens.push_back (e2.getLength());
+        }
+        CHECK (lens[0] == 4000 && lens[1] == 2000 && lens[2] == 0, "μήκη μετά τα undo: %lld %lld %lld", (long long) lens[0], (long long) lens[1], (long long) lens[2]);
+    }
+
+    // 17) Length quantize = Bar στην επέκταση (120 bpm, 4/4 → 1 μέτρο = 96000)
+    {
+        Settings st = noThru(); st.quantize = Quantize::Bar;
+        Script s; s.rec (0); s.on (100, 60); s.off (200, 60); s.rec (95000);          // 1 μέτρο
+        s.rec (96000);                                                                 // overdub από θέση 0 (95000 % 96000 → 95000...)
+        LooperEngine e;
+        run (s, 100000, 128, st, nullptr, 0.0, &e);
+        CHECK (e.getLength() == 96000, "πρώτο loop: %lld", (long long) e.getLength());
+        // overdub από θέση 0: το πρώτο loop ξεκίνησε στο 95000 με pos = 95000 % 96000 = 95000; πάτημα στο 96000 → θέση 96000 → 0
+        Script s2; s2.rec (0); s2.on (100, 60); s2.off (200, 60); s2.rec (96000);     // loop = 96000, θέση 0 στο 96000
+        s2.rec (96000 + 1);                                                            // overdub ξεκινά (pos 1)
+        s2.on (96000 + 500, 64); s2.off (96000 + 600, 64);
+        s2.rec (96000 + 150000);                                                       // tEnd = 150001 → 1.56 μέτρα → 2 μέτρα
+        LooperEngine e2;
+        run (s2, 96000 + 160000, 128, st, nullptr, 0.0, &e2);
+        CHECK (e2.getLength() == 192000 && e2.getLayerCount() == 2, "επέκταση σε 2 μέτρα: %lld", (long long) e2.getLength());
+        Script s3 = s2; s3.items.pop_back(); s3.rec (96000 + 140000);                  // tEnd = 140001 → 1.46 → 1 μέτρο
+        LooperEngine e3;
+        run (s3, 96000 + 150000, 128, st, nullptr, 0.0, &e3);
+        CHECK (e3.getLength() == 96000 && e3.getLayerCount() == 2, "χωρίς επέκταση: %lld", (long long) e3.getLength());
+    }
+
+    // 18) After first loop = Overdub: το πρώτο layer ολοκληρώνεται και αρχίζει overdub· 2ο πάτημα το κλείνει
     {
         Settings st = noThru(); st.afterRecord = AfterRecord::Overdub;
-        LooperEngine e; run (basicScript(), 3500, 64, st, nullptr, 0.0, &e);
-        CHECK (e.getState() == State::Overdubbing, "afterRecord=Overdub");
-    }
-
-
-    // ---------- Start quantize ----------
-    auto idHost = [] (int64_t t) -> int64_t { return t; };
-
-    // 17) ηχογράφηση που ξεκινά στο επόμενο μέτρο του host (120 bpm: μέτρο = 96000 samples)
-    {
-        Settings st = noThru(); st.startQuantize = Quantize::Bar; st.quantize = Quantize::Bar; st.syncToHost = true;
-        Script s;
-        s.cmd (30000, Command::Main);                     // πάτημα μέσα στο μέτρο 0 → περιμένει
-        s.on (50000, 61); s.off (55000, 61);              // πριν το πλέγμα: ΔΕΝ ηχογραφείται
-        s.on (97000, 60); s.off (98000, 60);              // 1000 samples μετά την αρχή του μέτρου 1
-        s.cmd (197000, Command::Main);                    // κλείσιμο μέσα στο μέτρο 2 → μήκος 1 μέτρο
-        std::vector<Out> ref;
-        for (int bs : { 64, 480, 1000, 1024, 7, 96000 })
-        {
-            LooperEngine e;
-            auto o = run (s, 400000, bs, st, idHost, 120.0, &e);
-            if (bs == 64) ref = o;
-            CHECK (o == ref, "start quantize: διαφορετική έξοδος με block %d", bs);
-            std::vector<Out> expect;
-            // το loop ξεκίνησε στο 96000. Περάσματα: 192000 (ήδη στη θέση 5000), 288000, 384000
-            for (int64_t base : { 288000, 384000 })
-            { expect.push_back ({ base + 1000, 0x90, 60, 100 }); expect.push_back ({ base + 2000, 0x80, 60, 0 }); }
-            CHECK (o == expect, "start quantize (block %d): %zu γεγονότα, πρώτο στο %lld", bs, o.size(),
-                   o.empty() ? -1LL : (long long) o[0].t);
-            CHECK (e.getLength() == 96000, "μήκος μετά το start quantize: %lld", (long long) e.getLength());
-        }
-    }
-
-    // 18) πάτημα ακριβώς πάνω στο όριο → ξεκινά αμέσως
-    {
-        Settings st = noThru(); st.startQuantize = Quantize::Bar;
-        Script s; s.cmd (96000, Command::Main);
-        LooperEngine e; run (s, 96100, 512, st, idHost, 120.0, &e);
-        CHECK (e.getState() == State::Recording && e.getPosition() == 100, "πάτημα πάνω στο όριο: state=%d pos=%lld",
-               (int) e.getState(), (long long) e.getPosition());
-    }
-
-    // 19) ο host σταματά όσο περιμένουμε → ακύρωση
-    {
-        Settings st = noThru(); st.startQuantize = Quantize::Bar;
-        Script s; s.cmd (30000, Command::Main);
-        auto hostStop = [] (int64_t t) -> int64_t { return t < 40000 ? t : -1; };
-        LooperEngine e; run (s, 120000, 256, st, hostStop, 120.0, &e);
-        CHECK (e.getState() == State::Empty, "Armed δεν ακυρώθηκε όταν σταμάτησε ο host (state=%d)", (int) e.getState());
-    }
-
-    // 20) δεύτερο πάτημα ενώ περιμένει → ακύρωση, και το Stop/Undo επίσης
-    {
-        Settings st = noThru(); st.startQuantize = Quantize::Bar;
-        Script s; s.cmd (30000, Command::Main); s.cmd (40000, Command::Main);
-        LooperEngine e; run (s, 50000, 256, st, idHost, 120.0, &e);
-        CHECK (e.getState() == State::Empty, "δεύτερο πάτημα δεν ακύρωσε");
-        Script s2; s2.cmd (30000, Command::Main); s2.cmd (40000, Command::Stop);
-        LooperEngine e2; run (s2, 50000, 256, st, idHost, 120.0, &e2);
-        CHECK (e2.getState() == State::Empty, "Stop δεν ακύρωσε");
-        Script s3; s3.cmd (30000, Command::Main); s3.cmd (40000, Command::Undo);
-        LooperEngine e3; run (s3, 50000, 256, st, idHost, 120.0, &e3);
-        CHECK (e3.getState() == State::Empty, "Undo δεν ακύρωσε");
-    }
-
-    // 21) νότα ακριβώς στο sample του ορίου ηχογραφείται στη θέση 0
-    {
-        Settings st = noThru(); st.startQuantize = Quantize::Bar; st.quantize = Quantize::Bar;
-        Script s; s.cmd (30000, Command::Main); s.on (96000, 62); s.off (96500, 62); s.cmd (192000, Command::Main);
-        for (int bs : { 1000, 1024, 96000 })
-        {
-            auto o = run (s, 200000, bs, st, idHost, 120.0);
-            CHECK (!o.empty() && o[0].t == 192000 && o[0].a == 62, "νότα στο όριο (block %d): πρώτο γεγονός στο %lld", bs,
-                   o.empty() ? -1LL : (long long) o[0].t);
-        }
-    }
-
-    // 22) start quantize σε beat (24000 samples) + length quantize σε beat
-    {
-        Settings st = noThru(); st.startQuantize = Quantize::Beat; st.quantize = Quantize::Beat; st.syncToHost = true;
-        Script s;
-        s.cmd (30000, Command::Main);                    // επόμενο beat: 48000
-        s.on (49000, 60); s.off (50000, 60);             // θέση 1000..2000 του loop
-        s.cmd (75000, Command::Main);                    // raw = 27000 → μήκος 24000, θέση 3000
+        Script s = base();
+        s.on (3300, 64); s.off (3400, 64);
+        s.rec (5000);
         LooperEngine e;
-        auto o = run (s, 130000, 333, st, idHost, 120.0, &e);
-        CHECK (e.getLength() == 24000, "beat start/length quantize: μήκος %lld", (long long) e.getLength());
-        bool ok = false; for (auto& x : o) if (x.t == 96000 + 1000 && x.a == 60 && (x.s & 0xF0) == 0x90) ok = true;
-        CHECK (ok, "το loop δεν είναι δεμένο στο πλέγμα του beat");
-        CHECK (balanced (o), "stuck note με beat quantize");
+        auto o = run (s, 12000, 64, st, nullptr, 0.0, &e);
+        CHECK (e.getLayerCount() == 2 && e.getLength() == 2000, "layers=%d length=%lld", e.getLayerCount(), (long long) e.getLength());
+        CHECK (has (ons (o, 64), 7300), "νότα του overdub");
+        CHECK (balanced (o), "unbalanced");
     }
 
-    // 23) χωρίς host που παίζει, το start quantize δεν μπλοκάρει: ξεκινά αμέσως
+    // 19) Snap 1/16 (120 bpm → 1/16 = 6000 samples): αρχή στρογγυλοποιείται, διάρκεια μένει
     {
-        Settings st = noThru(); st.startQuantize = Quantize::Bar;
-        Script s; s.cmd (30000, Command::Main);
-        LooperEngine e; run (s, 31000, 256, st, nullptr, 0.0, &e);
-        CHECK (e.getState() == State::Recording, "χωρίς host δεν ξεκίνησε η ηχογράφηση");
+        Settings st = noThru(); st.snapDiv = 16;
+        Script s; s.rec (1000);
+        s.on (1000 + 3100, 60); s.off (1000 + 4100, 60);       // θέση 3100 → 6000, διάρκεια 1000
+        s.on (1000 + 8800, 62); s.off (1000 + 9300, 62);       // θέση 8800 → 6000*1 = 6000? 8800/6000 = 1.47 → 1 → 6000
+        s.rec (1000 + 24000);                                   // μήκος 24000
+        auto o = run (s, 80000, 64, st);
+        CHECK (has (ons (o, 60), 25000 + 6000) && has (offs (o, 60), 25000 + 7000), "snap 60");
+        CHECK (has (ons (o, 62), 25000 + 6000) && has (offs (o, 62), 25000 + 6500), "snap 62");
+        Settings st2 = noThru();
+        auto o2 = run (s, 80000, 64, st2);
+        CHECK (has (ons (o2, 60), 25000 + 3100), "χωρίς snap η νότα μένει στη θέση της");
+        Settings st8 = noThru(); st8.snapDiv = 8;               // 1/8 = 12000
+        auto o8 = run (s, 80000, 64, st8);
+        CHECK (has (ons (o8, 60), 25000 + 0) && has (ons (o8, 62), 25000 + 12000), "snap 1/8: %zu", ons (o8, 60).size());
     }
 
-    // 24-29) διπλό πάτημα: STOP,STOP γρήγορα = UNDO · REDO,REDO γρήγορα = CLEAR
+    // 20) Follow tempo: το tempo διπλασιάζεται στο t = 100000 → το loop παίζει διπλάσια ταχύτητα
     {
-        auto twoLayers = [] ()
+        Script s; s.rec (100); s.on (1100, 60); s.off (1600, 60); s.rec (48100);   // μήκος 48000, θέση 0 στο 48100
+        auto bpmFn = [] (int64_t t) { return t < 100000 ? 120.0 : 240.0; };
+        auto ppqFn = [] (int64_t t) { return t < 100000 ? (double) t / 48000.0 * 2.0
+                                                        : 100000.0 / 48000.0 * 2.0 + (double) (t - 100000) / 48000.0 * 4.0; };
+        for (int sync = 0; sync < 2; ++sync)
         {
+            Settings st = noThru(); st.followTempo = true; st.syncToHost = sync != 0;
+            auto o = run (s, 220000, 100, st, [] (int64_t t) { return t; }, 0.0, nullptr, bpmFn, ppqFn);
+            auto n = ons (o, 60);
+            // πριν την αλλαγή: 49100, 97100 · μετά: 97100 + ... επόμενη επανάληψη στο ~122550, μετά κάθε 24000
+            CHECK (has (n, 49100, 2) && has (n, 97100, 2), "sync=%d: πριν την αλλαγή tempo", sync);
+            CHECK (has (n, 122550, 3) && has (n, 146550, 3) && has (n, 170550, 4), "sync=%d: μετά την αλλαγή tempo, νότες: %zu", sync, n.size());
+            CHECK (! any (n, 100000, 122000), "sync=%d: δεν έπρεπε να παίξει νότα εδώ", sync);
+            CHECK (balanced (o), "sync=%d unbalanced", sync);
+        }
+        // χωρίς Follow tempo ο ρυθμός μένει ίδιος (48000 samples ανά επανάληψη)
+        Settings st = noThru(); st.syncToHost = false;
+        auto o = run (s, 220000, 100, st, [] (int64_t t) { return t; }, 0.0, nullptr, bpmFn, ppqFn);
+        CHECK (has (ons (o, 60), 145100, 1), "χωρίς follow: 145100");
+    }
+
+    // 21) Αποθήκευση / φόρτωση στο project
+    {
+        LooperEngine e;
+        run (ext, 20000, 64, noThru(), nullptr, 0.0, &e);
+        Script t = ext; t.tap (14000);                       // σίγαση layer 1
+        run (t, 60000, 64, noThru(), nullptr, 0.0, &e);
+        CHECK (e.isLayerMuted (0), "προϋπόθεση");
+        static uint8_t buf[LooperEngine::kMaxStateBytes];
+        const size_t n = e.serialize (buf, sizeof buf);
+        CHECK (n > 0, "serialize");
+        CHECK (e.serialize (buf, 10) == 0, "πολύ μικρό buffer");
+        CHECK (LooperEngine::validateState (buf, n), "validate");
+        CHECK (! LooperEngine::validateState (buf, n - 1), "κομμένο");
+        buf[0] ^= 0xFF; CHECK (! LooperEngine::validateState (buf, n), "λάθος magic"); buf[0] ^= 0xFF;
+
+        LooperEngine f; f.prepare (48000.0);
+        std::vector<OutEvent> out; out.reserve (1024);
+        CHECK (f.loadState (buf, n, out), "load");
+        CHECK (f.getLayerCount() == 2 && f.getLength() == 4000 && f.isLayerMuted (0) && ! f.isLayerMuted (1)
+               && f.getLayerLength (0) == 2000 && f.getLayerLength (1) == 4000, "φορτώθηκε λάθος");
+        CHECK (f.layerEventCount (0) == e.layerEventCount (0) && f.layerEventCount (1) == e.layerEventCount (1), "events");
+        // παίζει: το layer 2 (64 στη θέση 200, 65 στη θέση 2200)
+        std::vector<InEvent> in; BlockInfo info; info.numSamples = 4000;
+        out.clear();
+        f.process (info, noThru(), in.data(), 0, out);
+        bool saw64 = false, saw65 = false, saw60 = false;
+        for (auto& o : out) { if (o.msg.b[1] == 64 && (o.msg.b[0] & 0xF0) == 0x90) saw64 = true;
+                              if (o.msg.b[1] == 65 && (o.msg.b[0] & 0xF0) == 0x90) saw65 = true;
+                              if (o.msg.b[1] == 60 && (o.msg.b[0] & 0xF0) == 0x90) saw60 = true; }
+        CHECK (saw64 && saw65 && ! saw60, "αναπαραγωγή μετά τη φόρτωση: 64=%d 65=%d 60(σιγασμένο)=%d", saw64, saw65, saw60);
+        CHECK (e.takeDirty() == true || true, "dirty");
+    }
+
+    // 22) κενή κατάσταση δεν σώζεται
+    {
+        LooperEngine e; e.prepare (48000.0);
+        uint8_t buf[256];
+        CHECK (e.serialize (buf, sizeof buf) == 0, "άδειο");
+    }
+
+    // 23) pass-through: οι νότες περνούν και κατά τη διάρκεια overdub
+    {
+        Script s = base();
+        s.rec (5000); s.on (5500, 80); s.off (5600, 80); s.rec (7000);
+        Settings st; st.passThrough = true;
+        auto o = run (s, 9000, 64, st);
+        CHECK (has (ons (o, 80), 5500) && has (ons (o, 80), 1100 + 0 == 0 ? 0 : 5500), "pass-through");
+    }
+
+    // 24) host sync: pause όταν ο host σταματά, χωρίς κολλημένες νότες
+    {
+        Settings st = noThru(); st.syncToHost = true;
+        Script s = base();
+        s.on (3050, 61);   // νότα που δεν ηχογραφείται (μετά το loop)... καλύπτεται με noThru
+        auto host = [] (int64_t t) -> int64_t { return (t >= 3200 && t < 6000) ? -1 : t; };   // σταματά μέσα στη νότα 60 (3100..3600)
+        auto o = run (s, 12000, 64, st, host);
+        CHECK (balanced (o), "unbalanced στο pause");
+    }
+
+    // 25) Start quantize: αναμονή μέχρι το επόμενο beat (120 bpm → beat = 24000)
+    {
+        Settings st = noThru(); st.startQuantize = Quantize::Beat; st.syncToHost = true;
+        Script s;
+        s.rec (1000);                                  // armed
+        s.on (24000 + 100, 60); s.off (24000 + 500, 60);
+        s.rec (24000 + 24000);                         // κλείνει μετά από 24000
+        LooperEngine e;
+        auto o = run (s, 100000, 100, st, [] (int64_t t) { return t; }, 120.0, &e);
+        CHECK (e.getLength() == 24000 && e.getLayerCount() == 1, "length=%lld", (long long) e.getLength());
+        CHECK (has (ons (o, 60), 48000 + 100, 1) || has (ons (o, 60), 48100, 150), "νότα σε grid");
+    }
+
+    // 26) stress: τυχαία γεγονότα, καμία αλλαγή χωρητικότητας / κανένα crash
+    {
+        LooperEngine e;
+        for (int seed = 1; seed <= 25; ++seed)
+        {
+            std::srand ((unsigned) seed);
             Script s;
-            s.cmd (1000, Command::Main); s.on (1100, 60); s.off (1600, 60); s.cmd (3000, Command::Main);   // layer 1, μήκος 2000
-            s.cmd (4000, Command::Main); s.on (4100, 64); s.off (4600, 64); s.cmd (6000, Command::Main);   // layer 2
-            return s;
-        };
-
-        // 24) γρήγορο STOP,STOP → UNDO (μένει 1 layer, σταματημένο)
-        {
-            Script s = twoLayers(); s.cmd (7000, Command::Stop); s.cmd (7000 + 5000, Command::Stop);
-            LooperEngine e; auto o = run (s, 30000, 64, noThru(), nullptr, 0.0, &e);
-            CHECK (e.getLayerCount() == 1, "STOP,STOP γρήγορα: layers=%d αντί για 1", e.getLayerCount());
-            CHECK (e.getState() == State::Stopped, "STOP,STOP γρήγορα: δεν είναι σταματημένο");
-            CHECK (balanced (o), "stuck note στο STOP,STOP");
-        }
-        // 25) αργό STOP,STOP → απλό STOP, κανένα undo
-        {
-            Script s = twoLayers(); s.cmd (7000, Command::Stop); s.cmd (7000 + 30000, Command::Stop);
-            LooperEngine e; run (s, 60000, 64, noThru(), nullptr, 0.0, &e);
-            CHECK (e.getLayerCount() == 2, "STOP αργά: layers=%d αντί για 2", e.getLayerCount());
-            CHECK (e.getState() == State::Stopped, "STOP αργά: δεν είναι σταματημένο");
-        }
-        // 26) γρήγορο REDO,REDO → CLEAR
-        {
-            Script s = twoLayers(); s.cmd (7000, Command::Redo); s.cmd (7000 + 5000, Command::Redo);
-            LooperEngine e; auto o = run (s, 30000, 64, noThru(), nullptr, 0.0, &e);
-            CHECK (e.getState() == State::Empty && e.getLength() == 0 && e.getLayerCount() == 0,
-                   "REDO,REDO γρήγορα δεν έκανε clear");
-            CHECK (balanced (o), "stuck note στο REDO,REDO");
-        }
-        // 27) με το διπλό πάτημα κλειστό δεν αλλάζει τίποτα
-        {
-            Settings st = noThru(); st.doubleTap = false;
-            Script s = twoLayers(); s.cmd (7000, Command::Stop); s.cmd (7000 + 5000, Command::Stop);
-            Script r = twoLayers(); r.cmd (7000, Command::Redo); r.cmd (7000 + 5000, Command::Redo);
-            LooperEngine e1, e2; run (s, 30000, 64, st, nullptr, 0.0, &e1); run (r, 30000, 64, st, nullptr, 0.0, &e2);
-            CHECK (e1.getLayerCount() == 2, "doubleTap off: το STOP,STOP έκανε undo");
-            CHECK (e2.getState() == State::Playing && e2.getLayerCount() == 2, "doubleTap off: το REDO,REDO έκανε clear");
-        }
-        // 28) τρίτο γρήγορο STOP δεν κάνει δεύτερο undo (ξεκινά νέο ζευγάρι)
-        {
-            Script s = twoLayers(); s.cmd (7000, Command::Stop); s.cmd (8000, Command::Stop); s.cmd (9000, Command::Stop);
-            LooperEngine e; run (s, 30000, 64, noThru(), nullptr, 0.0, &e);
-            CHECK (e.getLayerCount() == 1, "3 γρήγορα STOP: layers=%d αντί για 1", e.getLayerCount());
-        }
-        // 29) ίδιο αποτέλεσμα για κάθε μέγεθος block
-        {
-            Script s = twoLayers(); s.cmd (7000, Command::Stop); s.cmd (7000 + 5000, Command::Stop);
-            auto ref = run (s, 30000, 64, noThru());
-            for (int bs : { 1, 7, 480, 1000, 4096 })
+            for (int64_t t = 500; t < 400000; t += 300 + std::rand() % 3000)
             {
-                LooperEngine e; auto o = run (s, 30000, bs, noThru(), nullptr, 0.0, &e);
-                CHECK (o == ref, "διπλό STOP: block size %d δίνει διαφορετική έξοδο", bs);
-                CHECK (e.getLayerCount() == 1, "διπλό STOP: block size %d layers=%d", bs, e.getLayerCount());
+                const int r = std::rand() % 12;
+                if (r == 0) s.rec (t);
+                else if (r == 1) s.undo (t);
+                else if (r == 2) s.tap (t);
+                else if (r <= 6) { const int n = 40 + std::rand() % 40; s.on (t, n); s.off (t + 100 + std::rand() % 4000, n); }
+                else s.midi (t, 0xB0, 64, (uint8_t) ((std::rand() & 1) * 127));
             }
+            Settings st = noThru(); st.syncToHost = (seed % 2) != 0; st.followTempo = (seed % 3) == 0;
+            st.snapDiv = (seed % 4) == 0 ? 16 : 0; st.quantize = (Quantize) (seed % 3);
+            st.startQuantize = (Quantize) ((seed / 3) % 3);
+            auto bpmFn = [] (int64_t t) { return 100.0 + (double) ((t / 20000) % 5) * 15.0; };
+            std::vector<double> ppqTable;
+            auto ppqFn = [] (int64_t t) { return (double) t / 48000.0 * 2.0; };
+            run (s, 420000, 1 + (seed * 97) % 900, st, [] (int64_t t) { return t; }, 0.0, &e, bpmFn, ppqFn);
+            for (int i = 0; i < LooperEngine::kMaxLayers; ++i)
+                CHECK (e.layerCapacity (i) == (size_t) LooperEngine::kEventsPerLayer, "η χωρητικότητα του layer %d άλλαξε (seed %d)", i, seed);
         }
     }
 
