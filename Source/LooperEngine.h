@@ -6,7 +6,9 @@
 //  - Έως kMaxLayers (4) layers. Κάθε layer έχει δικό του μήκος `len`. Το μήκος του loop
 //    είναι το μήκος του νεότερου layer. Τα παλαιότερα (πιο κοντά) layers επαναλαμβάνονται
 //    κυκλικά για να γεμίσουν το loop, και κόβονται στο τέλος του loop αν δεν χωράνε ακέραιες φορές.
-//  - Overdub που ξεπερνά το τέλος του loop το μεγαλώνει (στρογγυλοποίηση με το Length quantize).
+//  - Το πάτημα του REC για overdub ξαναρχίζει όλα τα layers από την αρχή (μετά από αναμονή του Start quantize)
+//    και το νέο layer ηχογραφείται από εκεί. Αν το overdub ξεπεράσει το τέλος του loop, το loop μεγαλώνει
+//    (στρογγυλοποίηση με το Length quantize).
 //  - UNDO: σβήνει το νεότερο layer· το μήκος γυρίζει στο μήκος του προηγούμενου.
 //  - STOP: N γρήγορα πατήματα (παράθυρο tapWindowMs μετά το τελευταίο) σιγάζουν/ενεργοποιούν το layer N.
 //  - Follow tempo: οι θέσεις αποθηκεύονται σε "samples αναφοράς" (στο tempo της ηχογράφησης)
@@ -107,6 +109,7 @@ public:
     double getRefBpm() const { return refBpm; }
     double getRate() const { return rate; }
     int getPendingTaps() const { return tapCount; }
+    bool isOverdubArmed() const { return odArmed; }
 
     int64_t layerEventCount (int i) const { return (int64_t) layers[(size_t) i].events.size(); }
 
@@ -129,6 +132,7 @@ public:
         }
 
         blockHostStart = info.hostSample;
+        curInfo = info;
         curBpm = info.bpm > 0.0 ? info.bpm : settings.fallbackBpm;
         curBarQN = info.barLengthQN > 0.0 ? info.barLengthQN : (double) std::max (1, settings.beatsPerBar);
 
@@ -288,6 +292,8 @@ private:
     std::array<Layer, kMaxLayers> layers;
     int64_t odStart = 0;         // θέση όπου ξεκίνησε το τρέχον overdub
     bool dirty = false;
+    bool odArmed = false;        // το overdub περιμένει το πλέγμα για να ξεκινήσει (το loop συνεχίζει να παίζει)
+    BlockInfo curInfo;
 
     double curBpm = 120.0;       // tempo του host στο τρέχον block
     double curBarQN = 4.0;
@@ -332,7 +338,7 @@ private:
         sustainRec.fill (false);
         outCount.fill (0); sustainOut.fill (false); bendOut.fill (false); liveHeld.fill (false);
         anchorValid = false; anchorPpqValid = false; pausedByHost = false; lastHostValid = false;
-        tapCount = 0;
+        tapCount = 0; odArmed = false;
         dirty = true;
     }
 
@@ -579,6 +585,24 @@ private:
 
     void advance (int from, int to, std::vector<OutEvent>& out)
     {
+        if (odArmed)
+        {
+            const int64_t bOff = armedBoundary - blockHostStart;
+            if (bOff < to)
+            {
+                const int at = (int) std::min<int64_t> (std::max<int64_t> (bOff, from), to);
+                advanceCore (from, at, out);
+                odArmed = false;
+                startOverdubNow (at, curInfo, out);
+                advanceCore (at, to, out);
+                return;
+            }
+        }
+        advanceCore (from, to, out);
+    }
+
+    void advanceCore (int from, int to, std::vector<OutEvent>& out)
+    {
         if (state == State::Armed) { maybeStartArmed (to); return; }
 
         int remaining = to - from;
@@ -629,6 +653,13 @@ private:
             const bool contiguous = info.hostPlaying && info.hostPositionValid && lastHostValid
                                     && info.hostSample == lastHostEnd;
             if (! contiguous) state = State::Empty;
+        }
+
+        if (odArmed)
+        {
+            const bool contiguous = info.hostPlaying && info.hostPositionValid && lastHostValid
+                                    && info.hostSample == lastHostEnd;
+            if (! contiguous) odArmed = false;
         }
 
         const bool active = settings.syncToHost && anchorValid && length > 0
@@ -767,6 +798,15 @@ private:
         state = State::Overdubbing;
     }
 
+    // Το πάτημα του REC για overdub: όλα τα layers ξαναρχίζουν από την αρχή και το νέο layer ηχογραφείται από εκεί.
+    void startOverdubNow (int offset, const BlockInfo& info, std::vector<OutEvent>& out)
+    {
+        if (layerCount >= kMaxLayers) return;
+        releaseAll (offset, out);
+        pos = 0; posFrac = 0.0;
+        beginOverdub (offset, info);
+    }
+
     // Ολοκληρώνει το overdub. Αν πέρασε το τέλος του loop, το loop μεγαλώνει.
     void commitOverdub (int offset, const BlockInfo& info, std::vector<OutEvent>& out, bool doReanchor)
     {
@@ -833,7 +873,12 @@ private:
         // να μένει δεμένη με την αρχή της ηχογράφησης και, άρα, με το πλέγμα του host.
         pos = raw % len; posFrac = 0.0;
         setAnchors (offset, info, (double) raw);
-        if (settings.afterRecord == AfterRecord::Overdub) beginOverdub (offset, info);
+        if (settings.afterRecord == AfterRecord::Overdub)
+        {
+            pos = 0;   // το πρώτο loop ξαναρχίζει από την αρχή και το overdub ηχογραφείται από εκεί
+            setAnchors (offset, info, 0.0);
+            beginOverdub (offset, info);
+        }
         else state = State::Playing;
     }
 
@@ -845,7 +890,7 @@ private:
         releaseControllers (offset, out);
         auto& L = layers[(size_t) layerCount];
         L.events.clear(); L.len = 0; L.muted = false;
-        tapCount = 0;
+        tapCount = 0; odArmed = false;
         dirty = true;
         if (layerCount == 0)
         {
@@ -920,7 +965,21 @@ private:
                         if (pos <= 0) { state = State::Empty; layers[0].events.clear(); discardHeld(); }
                         else closeFirstLoop (offset, info);
                         break;
-                    case State::Playing:     beginOverdub (offset, info); break;
+                    case State::Playing:
+                        if (odArmed) { odArmed = false; break; }                 // δεύτερο πάτημα = ακύρωση της αναμονής
+                        if (layerCount >= kMaxLayers) break;
+                        if (settings.startQuantize != Quantize::Off)
+                        {
+                            int64_t b = 0;
+                            if (nextGridBoundary (offset, info, b) && b > info.hostSample + offset)
+                            {
+                                armedBoundary = b;                               // το loop συνεχίζει μέχρι το πλέγμα
+                                odArmed = true;
+                                break;
+                            }
+                        }
+                        startOverdubNow (offset, info, out);
+                        break;
                     case State::Overdubbing: commitOverdub (offset, info, out, true); break;
                 }
                 break;
@@ -941,7 +1000,10 @@ private:
                     reanchorIfValid (offset, info, (double) pos + posFrac);
                 }
                 else if (state == State::Playing)
-                    undoLast (offset, info, out);
+                {
+                    if (odArmed) odArmed = false;   // το UNDO ακυρώνει πρώτα την αναμονή
+                    else undoLast (offset, info, out);
+                }
                 break;
 
             case Command::Stop:

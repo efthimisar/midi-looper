@@ -230,6 +230,7 @@ void LooperProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::MidiB
     uiMuteMask.store (mask);
     uiPendingTaps.store (engine.getPendingTaps());
     uiPaused.store (engine.isPausedByHost() ? 1 : 0);
+    uiOdArmed.store (engine.isOverdubArmed() ? 1 : 0);
     uiPos.store (engine.getPosition());
     uiLength.store (engine.getLength());
     uiOdStart.store (engine.getOverdubStart());

@@ -457,7 +457,7 @@ void LooperEditor::paint (juce::Graphics& g)
 
 void LooperEditor::timerCallback()
 {
-    const auto state = (ml::State) proc.uiState.load();
+    auto state = (ml::State) proc.uiState.load();
     const double sr = proc.uiSampleRate.load();
 
     shown.state = (int) state;
@@ -477,6 +477,8 @@ void LooperEditor::timerCallback()
         return n + (std::fabs (bars - 1.0) < 0.02 ? " bar" : " bars");
     };
     juce::ignoreUnused (sr);
+
+    if (state == ml::State::Playing && proc.uiOdArmed.load() != 0) state = ml::State::Armed;
 
     juce::String text;
     switch (state)

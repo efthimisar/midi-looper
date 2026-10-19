@@ -45,7 +45,7 @@ public:
     juce::AudioProcessorValueTreeState apvts;
 
     // κατάσταση για εμφάνιση (γράφεται από το audio thread)
-    std::atomic<int> uiState { 0 }, uiLayers { 0 }, uiPaused { 0 }, uiMuteMask { 0 }, uiPendingTaps { 0 };
+    std::atomic<int> uiState { 0 }, uiLayers { 0 }, uiPaused { 0 }, uiMuteMask { 0 }, uiPendingTaps { 0 }, uiOdArmed { 0 };
     std::atomic<int64_t> uiPos { 0 }, uiLength { 0 }, uiOdStart { 0 };
     std::array<std::atomic<int64_t>, kMaxLayers> uiLayerLen;
     std::atomic<double> uiBarSamples { 96000.0 };   // μήκος μέτρου σε samples αναφοράς

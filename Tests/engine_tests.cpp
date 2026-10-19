@@ -340,7 +340,7 @@ int main()
         s.rec (17000);                      // 6000 στο timeline του overdub: 2000+6000 = 8000 → loop 8000
         LooperEngine e;
         run (s, 30000, 64, noThru(), nullptr, 0.0, &e);
-        CHECK (e.getLayerCount() == 3 && e.getLength() == 8000, "layers=%d length=%lld", e.getLayerCount(), (long long) e.getLength());
+        CHECK (e.getLayerCount() == 3 && e.getLength() == 6000, "layers=%d length=%lld", e.getLayerCount(), (long long) e.getLength());
         Script u = s; u.undo (30000); u.undo (31000); u.undo (32000);
         std::vector<int64_t> lens;
         for (int64_t T : { 30500, 31500, 32500 })
@@ -525,6 +525,42 @@ int main()
             for (int i = 0; i < LooperEngine::kMaxLayers; ++i)
                 CHECK (e.layerCapacity (i) == (size_t) LooperEngine::kEventsPerLayer, "η χωρητικότητα του layer %d άλλαξε (seed %d)", i, seed);
         }
+    }
+
+    // 27) overdub: όλα ξαναρχίζουν από την αρχή τη στιγμή του πατήματος
+    {
+        Script s = base();                       // loop 2000, νότα 60 στη θέση 100, ξεκινά στο 3000
+        s.rec (4000);                            // overdub (θέση 1000) → επανεκκίνηση
+        s.on (4500, 64); s.off (4600, 64);       // νέο layer, θέση 500
+        s.rec (5500);                            // κλείσιμο στη θέση 1500 (< μήκος)
+        LooperEngine e;
+        auto o = run (s, 9000, 64, noThru(), nullptr, 0.0, &e);
+        CHECK (e.getLayerCount() == 2 && e.getLength() == 2000, "layers=%d len=%lld", e.getLayerCount(), (long long) e.getLength());
+        CHECK (has (ons (o, 60), 4100), "το layer 1 δεν ξαναρχίζει από την αρχή");
+        CHECK (! has (ons (o, 60), 5100), "το layer 1 συνέχισε παλιά θέση");
+        CHECK (has (ons (o, 64), 6500), "το νέο layer ξεκινά από την αρχή: %zu", ons (o, 64).size());
+        CHECK (has (ons (o, 60), 6100), "συνέχεια layer 1");
+        CHECK (balanced (o), "unbalanced");
+    }
+
+    // 28) overdub με Start quantize: αναμονή μέχρι το πλέγμα, ακύρωση με REC ή UNDO
+    {
+        Settings st = noThru(); st.startQuantize = Quantize::Beat;   // 120 bpm: 1 beat = 24000
+        auto host = [] (int64_t t) { return t; };
+        Script s; s.rec (0); s.on (100, 60); s.off (500, 60); s.on (12000, 62); s.off (12400, 62); s.rec (24000);
+        Script a = s; a.rec (30000);
+        LooperEngine e1; auto o1 = run (a, 40000, 100, st, host, 120.0, &e1);
+        CHECK (e1.isOverdubArmed() && e1.getState() == State::Playing, "armed=%d", (int) e1.isOverdubArmed());
+        CHECK (has (ons (o1, 62), 36000), "το loop δεν συνεχίζει όσο περιμένει");
+        LooperEngine e2; auto o2 = run (a, 50000, 100, st, host, 120.0, &e2);
+        CHECK (! e2.isOverdubArmed() && e2.getState() == State::Overdubbing, "state=%d", (int) e2.getState());
+        Script b = a; b.rec (35000);
+        LooperEngine e3; run (b, 50000, 100, st, host, 120.0, &e3);
+        CHECK (! e3.isOverdubArmed() && e3.getState() == State::Playing && e3.getLayerCount() == 1, "cancel με REC");
+        Script c = a; c.undo (35000);
+        LooperEngine e4; run (c, 50000, 100, st, host, 120.0, &e4);
+        CHECK (! e4.isOverdubArmed() && e4.getState() == State::Playing && e4.getLayerCount() == 1, "cancel με UNDO");
+        CHECK (balanced (o2), "unbalanced");
     }
 
     if (failures == 0) std::printf("ΟΛΑ ΤΑ TESTS ΠΕΡΑΣΑΝ\n");
