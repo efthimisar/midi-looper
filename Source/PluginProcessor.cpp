@@ -231,6 +231,8 @@ void LooperProcessor::processBlock (juce::AudioBuffer<float>& audio, juce::MidiB
     uiPendingTaps.store (engine.getPendingTaps());
     uiPaused.store (engine.isPausedByHost() ? 1 : 0);
     uiOdArmed.store (engine.isOverdubArmed() ? 1 : 0);
+    uiUndoCount.store (engine.getUndoCount());
+    uiStopCount.store (engine.getStopCount());
     uiPos.store (engine.getPosition());
     uiLength.store (engine.getLength());
     uiOdStart.store (engine.getOverdubStart());

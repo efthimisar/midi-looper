@@ -110,6 +110,8 @@ public:
     double getRate() const { return rate; }
     int getPendingTaps() const { return tapCount; }
     bool isOverdubArmed() const { return odArmed; }
+    int getUndoCount() const { return undoCount; }   // πόσα UNDO / STOP πατήματα επεξεργάστηκαν (για animation)
+    int getStopCount() const { return stopCount; }
 
     int64_t layerEventCount (int i) const { return (int64_t) layers[(size_t) i].events.size(); }
 
@@ -328,6 +330,7 @@ private:
     // ---------- πολλαπλά πατήματα STOP ----------
     int64_t clock = 0;              // samples που έχουν περάσει (δεν εξαρτάται από τον host)
     int tapCount = 0;
+    int undoCount = 0, stopCount = 0;
     int64_t tapExpiry = 0;
 
     void hardReset()
@@ -937,6 +940,8 @@ private:
 
     void doCommand (Command c, int offset, const BlockInfo& info, std::vector<OutEvent>& out)
     {
+        if (c == Command::Undo) ++undoCount;
+        else if (c == Command::Stop) ++stopCount;
         switch (c)
         {
             case Command::Main:

@@ -16,6 +16,10 @@ FetchContent_Declare(JUCE
     GIT_SHALLOW ON)
 FetchContent_MakeAvailable(JUCE)
 
+# Γραμματοσειρά Carlito Bold (SIL Open Font License) ενσωματωμένη στο plugin
+juce_add_binary_data(MidiLooperResources SOURCES Resources/Carlito-Bold.ttf)
+set_target_properties(MidiLooperResources PROPERTIES POSITION_INDEPENDENT_CODE TRUE)
+
 set(LOOPER_SOURCES
     Source/LooperEngine.h
     Source/PluginProcessor.h
@@ -65,6 +69,7 @@ function(add_looper_variant target product_name plugin_code is_effect)
     target_link_libraries(${target}
         PRIVATE
             juce::juce_audio_utils
+            MidiLooperResources
         PUBLIC
             juce::juce_recommended_config_flags
             juce::juce_recommended_lto_flags

@@ -1,4 +1,5 @@
 #include "PluginEditor.h"
+#include "BinaryData.h"
 #include <cmath>
 
 namespace
@@ -6,37 +7,53 @@ namespace
     // Σειρά πεταλιών: REC, UNDO, STOP
     const ml::Command kCmds[LooperProcessor::kNumCommands] = { ml::Command::Main, ml::Command::Undo, ml::Command::Stop };
 
-    // Θέσεις (λογικά pixel)
-    constexpr int kWidth = 600, kHeight = 414;
-    constexpr int kPadSize = 92, kPadY = 266;
-    constexpr int kPadX[3] = { 54, 254, 454 };
+    // Θέσεις (λογικά pixel) — τετράγωνο παράθυρο 480 x 480
+    constexpr int kSize = 480;
+    constexpr int kPadCentreX[3] = { 90, 240, 390 };
+    constexpr int kPadCentreY = 402, kPadBox = 100;
+    constexpr int kTileX[7] = { 34, 94, 154, 214, 274, 334, 394 };
+    constexpr int kTileY = 267, kTileSize = 52;
 
-    constexpr int kRowX = 70, kRowW = 84, kRowH = 26;
-    constexpr int kRowY[4] = { 62, 92, 122, 152 };
-    constexpr int kToggleY = 186;
-    constexpr int kToggleX[3] = { 34, 124, 214 };
-
-    constexpr float kLaneX = 196.0f, kLaneW = 370.0f, kLaneTop = 68.0f, kLaneH = 22.0f, kLanePitch = 32.0f;
+    constexpr float kLaneX = 30.0f, kLaneW = 420.0f, kLaneTop = 84.0f, kLaneH = 30.0f, kLanePitch = 40.0f;
+    constexpr float kGridTop = 80.0f, kGridH = 156.0f;
 
     // χρώματα (θερμά παστέλ)
     const juce::Colour kBodyTop     { 0xfff6f1ea };
     const juce::Colour kBodyBottom  { 0xffe8e0d6 };
+    const juce::Colour kScreen      { 0xff262220 };
+    const juce::Colour kStripScreen { 0xff3a3531 };
     const juce::Colour kPanel       { 0xff2b2724 };
     const juce::Colour kPanelLine   { 0xff3a3430 };
-    const juce::Colour kLabel       { 0xffc9bfb6 };
-    const juce::Colour kText        { 0xfff6f1ea };
+    const juce::Colour kText        { 0xfff3f4f6 };
     const juce::Colour kInk         { 0xff4a4038 };
+    const juce::Colour kIconGrey    { 0xffb7bbc6 };
+    const juce::Colour kOn          { 0xff7fcf98 };
+    const juce::Colour kOff         { 0xfff0766f };
     const juce::Colour kSage        { 0xff9ad4a8 };
     const juce::Colour kLilac       { 0xffc4aef0 };
-    const juce::Colour kPeach       { 0xffffb98a };
+    const juce::Colour kPeach       { 0xfff5b88a };
     const juce::Colour kCoral       { 0xffff8f84 };
-    const juce::Colour kButter      { 0xffffe08a };
-    const juce::Colour kRecDot      { 0xffe8845a };
-    const juce::Colour kMuted       { 0xff4a433e };
+    const juce::Colour kRed         { 0xfff26b6b };
+    const juce::Colour kButter      { 0xfff5de8a };
+    const juce::Colour kBlue        { 0xff8fc8f0 };
+    const juce::Colour kRingOff     { 0xffddd4c8 };
+    const juce::Colour kMuted       { 0xff3a3d46 };
 
     const juce::Colour kLayerColour[4] = { kSage, kLilac, juce::Colour (0xfff5de8a), juce::Colour (0xfff4a7b9) };
 
     enum PadSymbol { symNone = -1 };
+
+    juce::Colour mix (juce::Colour a, juce::Colour b, float t)   // t = 0 → a, t = 1 → b
+    {
+        return a.interpolatedWith (b, juce::jlimit (0.0f, 1.0f, t));
+    }
+
+    // 1 στην αρχή του παλμού, μαλακή πτώση, χαμηλά στο υπόλοιπο
+    float pulse (double phase)
+    {
+        const double p = phase - std::floor (phase);
+        return (float) (0.5 + 0.5 * std::cos (2.0 * juce::MathConstants<double>::pi * p));
+    }
 }
 
 // ---------------------------------------------------------------- σύμβολα
@@ -73,7 +90,7 @@ void drawSymbol (juce::Graphics& g, Symbol sym, juce::Point<float> c, float size
             juce::Path ring; ring.addEllipse (-9.0f, -9.0f, 18.0f, 18.0f);
             stroke (ring, 2.4f);
             juce::Path dot; dot.addEllipse (-4.2f, -4.2f, 8.4f, 8.4f);
-            fill (dot, kRecDot);
+            fill (dot, col);
             break;
         }
         case Symbol::Play:
@@ -180,11 +197,6 @@ void drawSymbol (juce::Graphics& g, Symbol sym, juce::Point<float> c, float size
 // ---------------------------------------------------------------- εμφάνιση
 LooperLookAndFeel::LooperLookAndFeel()
 {
-    setColour (juce::ComboBox::textColourId, kText);
-    setColour (juce::PopupMenu::backgroundColourId, juce::Colour (0xff38322e));
-    setColour (juce::PopupMenu::textColourId, kText);
-    setColour (juce::PopupMenu::highlightedBackgroundColourId, kSage);
-    setColour (juce::PopupMenu::highlightedTextColourId, kPanel);
     setColour (juce::TooltipWindow::backgroundColourId, juce::Colour (0xff38322e));
     setColour (juce::TooltipWindow::textColourId, kText);
     setColour (juce::TooltipWindow::outlineColourId, juce::Colour (0xff50473f));
@@ -199,33 +211,14 @@ void LooperLookAndFeel::drawButtonBackground (juce::Graphics& g, juce::Button& b
         return;
     }
 
-    const auto area = button.getLocalBounds().toFloat().reduced (4.0f);
-    const float d = juce::jmin (area.getWidth(), area.getHeight());
-    auto circle = juce::Rectangle<float> (d, d).withCentre (area.getCentre());
-    if (isDown) circle = circle.translated (0.0f, 1.5f);
+    // επίπεδο πετάλι: φωτεινός δακτύλιος 92 px και λευκό πρόσωπο 80 px, χωρίς σκιές
+    const auto centre = button.getLocalBounds().toFloat().getCentre();
+    const auto ringArgb = (juce::uint32) (int) button.getProperties().getWithDefault ("ring", (int) kRingOff.getARGB());
 
-    juce::Path p;
-    p.addEllipse (circle);
-    juce::DropShadow (juce::Colour (0xff504030).withAlpha (isDown ? 0.14f : 0.22f), isDown ? 3 : 8,
-                      { 0, isDown ? 1 : 3 }).drawForPath (g, p);
-
-    g.setColour (juce::Colour (isDown ? 0xfff1ece5 : 0xffffffff));
-    g.fillEllipse (circle);
-
-    // φωτισμός μέσα στο κουμπί
-    const auto glowArgb = (juce::uint32) (int) button.getProperties().getWithDefault ("glow", 0);
-    if (glowArgb != 0)
-    {
-        const auto glow = juce::Colour (glowArgb);
-        const auto c = circle.getCentre();
-        juce::ColourGradient grad (glow.withAlpha (0.90f), c.x, c.y, juce::Colours::white, c.x + d * 0.5f, c.y, true);
-        grad.addColour (0.55, glow.withAlpha (0.50f));
-        g.setGradientFill (grad);
-        g.fillEllipse (circle);
-    }
-
-    g.setColour (juce::Colour (0xffdcd6cf));
-    g.drawEllipse (circle.reduced (1.0f), 2.0f);
+    g.setColour (juce::Colour (ringArgb));
+    g.fillEllipse (juce::Rectangle<float> (92.0f, 92.0f).withCentre (centre));
+    g.setColour (juce::Colour (isDown ? 0xfff1ece5 : 0xfffbf9f5));
+    g.fillEllipse (juce::Rectangle<float> (80.0f, 80.0f).withCentre (centre));
 }
 
 void LooperLookAndFeel::drawButtonText (juce::Graphics& g, juce::TextButton& button, bool isHighlighted, bool isDown)
@@ -238,56 +231,48 @@ void LooperLookAndFeel::drawButtonText (juce::Graphics& g, juce::TextButton& but
 
     const int sym = (int) button.getProperties().getWithDefault ("symbol", (int) symNone);
     if (sym == symNone) return;
-    auto centre = button.getLocalBounds().toFloat().getCentre();
-    if (isDown) centre.y += 1.5f;
-    const auto colour = (Symbol) sym == Symbol::PadRecord ? kRecDot : kInk;
-    drawSymbol (g, (Symbol) sym, centre, 24.0f, colour);
+    drawSymbol (g, (Symbol) sym, button.getLocalBounds().toFloat().getCentre(), 21.0f, kInk);
 }
 
-void LooperLookAndFeel::drawToggleButton (juce::Graphics& g, juce::ToggleButton& button, bool, bool)
+// ---------------------------------------------------------- τετράγωνο κουμπί τιμής
+void ValueTile::paintButton (juce::Graphics& g, bool, bool isDown)
 {
-    const auto b = button.getLocalBounds().toFloat();
-    const float y = b.getCentreY() - 9.0f;
-    const juce::Rectangle<float> pill (b.getX(), y, 34.0f, 18.0f);
-    const bool on = button.getToggleState();
+    const float dy = isDown ? 1.0f : 0.0f;
+    const auto r = getLocalBounds().toFloat().reduced (0.5f);
 
-    g.setColour (on ? kSage : juce::Colour (0xff4a433e));
-    g.fillRoundedRectangle (pill, 9.0f);
-    g.setColour (on ? kPanel : juce::Colour (0xffa39a92));
-    g.fillEllipse (pill.getX() + (on ? 18.0f : 2.0f), pill.getY() + 2.0f, 14.0f, 14.0f);
+    g.setGradientFill (juce::ColourGradient (juce::Colour (isDown ? 0xff3d3733 : 0xff46403b), 0.0f, r.getY(),
+                                             juce::Colour (isDown ? 0xff24211f : 0xff2a2623), 0.0f, r.getBottom(), false));
+    g.fillRoundedRectangle (r, 9.0f);
+    g.setColour (juce::Colour (0xff1c1917));
+    g.drawRoundedRectangle (r, 9.0f, 1.0f);
+    g.setColour (juce::Colours::white.withAlpha (isDown ? 0.08f : 0.18f));
+    g.drawLine (r.getX() + 7.0f, r.getY() + 1.5f, r.getRight() - 7.0f, r.getY() + 1.5f, 1.0f);
 
-    const auto id = button.getComponentID();
-    const Symbol sym = id == "sync" ? Symbol::Sync : (id == "tempo" ? Symbol::Tempo : Symbol::Thru);
-    drawSymbol (g, sym, { pill.getRight() + 20.0f, b.getCentreY() }, 20.0f, on ? kLabel : juce::Colour (0xff8b8179));
-}
+    juce::Colour iconColour = kIconGrey;
+    if (isOnOff) iconColour = index == 1 ? kOn : kOff;
+    drawSymbol (g, symbol, { r.getCentreX(), 17.0f + dy }, 22.0f, iconColour);
 
-void LooperLookAndFeel::drawComboBox (juce::Graphics& g, int width, int height, bool, int, int, int, int, juce::ComboBox&)
-{
-    const auto b = juce::Rectangle<float> (0.0f, 0.0f, (float) width, (float) height).reduced (0.5f);
-    g.setColour (juce::Colour (0xff38322e));
-    g.fillRoundedRectangle (b, 6.0f);
-    g.setColour (juce::Colour (0xff50473f));
-    g.drawRoundedRectangle (b, 6.0f, 1.0f);
-
-    const float cx = (float) width - 14.0f, cy = (float) height * 0.5f;
-    juce::Path arrow;
-    arrow.startNewSubPath (cx - 4.0f, cy - 2.0f);
-    arrow.lineTo (cx, cy + 2.0f);
-    arrow.lineTo (cx + 4.0f, cy - 2.0f);
-    g.setColour (juce::Colour (0xffa39a92));
-    g.strokePath (arrow, juce::PathStrokeType (1.6f));
+    const juce::Font f (typeface != nullptr ? juce::FontOptions (typeface).withHeight (14.0f)
+                                            : juce::FontOptions (14.0f, juce::Font::bold));
+    g.setFont (f);
+    g.setColour (juce::Colour (0xffeceef2));
+    g.drawFittedText (labels[juce::jlimit (0, juce::jmax (0, labels.size() - 1), index)],
+                      juce::Rectangle<int> (1, 32 + (int) dy, getWidth() - 2, 14), juce::Justification::centred, 1, 0.7f);
 }
 
 // ------------------------------------------------------------------ παράθυρο
 LooperEditor::LooperEditor (LooperProcessor& p)
     : AudioProcessorEditor (&p), proc (p)
 {
+    typeface = juce::Typeface::createSystemTypefaceFor (BinaryData::CarlitoBold_ttf, (size_t) BinaryData::CarlitoBold_ttfSize);
+
     setLookAndFeel (&laf);
-    setSize (kWidth, kHeight);
+    setSize (kSize, kSize);
 
     statusLabel.setJustificationType (juce::Justification::centredLeft);
-    statusLabel.setFont (juce::FontOptions (19.0f, juce::Font::bold));
+    statusLabel.setFont (font (19.0f));
     statusLabel.setColour (juce::Label::textColourId, kText);
+    statusLabel.setInterceptsMouseClicks (false, false);
     addAndMakeVisible (statusLabel);
 
     const char* const padTips[3] = { "REC / PLAY / OVERDUB", "UNDO: removes the newest layer", "STOP: tap N times = silence / restore layer N" };
@@ -302,35 +287,30 @@ LooperEditor::LooperEditor (LooperProcessor& p)
     pads[1].getProperties().set ("symbol", (int) Symbol::Undo);
     pads[2].getProperties().set ("symbol", (int) Symbol::Stop);
 
-    startBox.addItemList ({ "Off", "Beat", "Bar" }, 1);
-    quantizeBox.addItemList ({ "Off", "Beat", "Bar" }, 1);
-    snapBox.addItemList ({ "Off", "1/8", "1/16" }, 1);
-    afterBox.addItemList ({ "Play", "Overdub" }, 1);
-    startBox.setTooltip ("Start quantize: recording starts on the next beat / bar (needs host playing)");
-    quantizeBox.setTooltip ("Length quantize: loop length snaps to beats / bars");
-    snapBox.setTooltip ("Snap notes: the start of each recorded note snaps to the grid");
-    afterBox.setTooltip ("After the first loop: play, or go straight into overdub");
-    for (auto* c : { &startBox, &quantizeBox, &snapBox, &afterBox })
+    struct Spec { const char* id; Symbol sym; juce::StringArray values; bool onOff; const char* tip; };
+    const Spec specs[kNumTiles] =
     {
-        c->setJustificationType (juce::Justification::centredLeft);
-        addAndMakeVisible (c);
+        { "startQuantize", Symbol::StartQ,  { "Off", "Beat", "Bar" },  false, "Start quantize: recording starts on the next beat / bar (needs host playing). Click to change." },
+        { "quantize",      Symbol::LengthQ, { "Off", "Beat", "Bar" },  false, "Length quantize: loop length snaps to beats / bars. Click to change." },
+        { "snap",          Symbol::Snap,    { "Off", "1/8", "1/16" },  false, "Snap notes: the start of each recorded note snaps to the grid. Click to change." },
+        { "afterRecord",   Symbol::Loop,    { "Play", "Overdub" },     false, "After the first loop: play, or go straight into overdub. Click to change." },
+        { "syncHost",      Symbol::Sync,    { "Off", "On" },           true,  "Sync to host transport. Click to switch On / Off." },
+        { "followTempo",   Symbol::Tempo,   { "Off", "On" },           true,  "Follow tempo: the loop follows tempo changes of the host. Click to switch On / Off." },
+        { "passThrough",   Symbol::Thru,    { "Off", "On" },           true,  "MIDI thru: pass live notes to the instrument. Click to switch On / Off." }
+    };
+    for (int i = 0; i < kNumTiles; ++i)
+    {
+        auto t = std::make_unique<ValueTile> (specs[i].sym, typeface);
+        t->setValues (specs[i].values, specs[i].onOff);
+        t->setTooltip (specs[i].tip);
+        t->onClick = [this, i] { cycleTile (i); };
+        addAndMakeVisible (*t);
+        tiles[(size_t) i] = std::move (t);
+        tileParams[(size_t) i] = proc.apvts.getParameter (specs[i].id);
     }
 
-    syncToggle.setComponentID ("sync");
-    tempoToggle.setComponentID ("tempo");
-    thruToggle.setComponentID ("thru");
-    syncToggle.setTooltip ("Sync to host transport");
-    tempoToggle.setTooltip ("Follow tempo: the loop follows tempo changes of the host");
-    thruToggle.setTooltip ("MIDI thru: pass live notes to the instrument");
-    for (auto* t : { &syncToggle, &tempoToggle, &thruToggle }) addAndMakeVisible (t);
-
-    startAtt    = std::make_unique<Combo> (proc.apvts, "startQuantize", startBox);
-    quantizeAtt = std::make_unique<Combo> (proc.apvts, "quantize", quantizeBox);
-    snapAtt     = std::make_unique<Combo> (proc.apvts, "snap", snapBox);
-    afterAtt    = std::make_unique<Combo> (proc.apvts, "afterRecord", afterBox);
-    syncAtt     = std::make_unique<Button> (proc.apvts, "syncHost", syncToggle);
-    tempoAtt    = std::make_unique<Button> (proc.apvts, "followTempo", tempoToggle);
-    thruAtt     = std::make_unique<Button> (proc.apvts, "passThrough", thruToggle);
+    lastUndoCount = proc.uiUndoCount.load();
+    lastStopCount = proc.uiStopCount.load();
 
     startTimerHz (30);
     timerCallback();
@@ -342,21 +322,34 @@ LooperEditor::~LooperEditor()
     setLookAndFeel (nullptr);
 }
 
+juce::Font LooperEditor::font (float height) const
+{
+    if (typeface != nullptr) return juce::Font (juce::FontOptions (typeface).withHeight (height));
+    return juce::Font (juce::FontOptions (height, juce::Font::bold));
+}
+
+void LooperEditor::cycleTile (int i)
+{
+    auto* prm = tileParams[(size_t) i];
+    auto& tile = *tiles[(size_t) i];
+    if (prm == nullptr || tile.getNumValues() < 2) return;
+
+    const int next = (tile.getIndex() + 1) % tile.getNumValues();   // μετά την τελευταία τιμή ξανά η πρώτη
+    prm->beginChangeGesture();
+    prm->setValueNotifyingHost (prm->convertTo0to1 ((float) next));
+    prm->endChangeGesture();
+    tile.setIndex (next);
+}
+
 void LooperEditor::resized()
 {
-    statusLabel.setBounds (34, 26, 532, 30);
+    statusLabel.setBounds (30, 44, 420, 28);
 
-    startBox.setBounds    (kRowX, kRowY[0], kRowW, kRowH);
-    quantizeBox.setBounds (kRowX, kRowY[1], kRowW, kRowH);
-    snapBox.setBounds     (kRowX, kRowY[2], kRowW, kRowH);
-    afterBox.setBounds    (kRowX, kRowY[3], kRowW, kRowH);
-
-    syncToggle.setBounds  (kToggleX[0], kToggleY, 66, kRowH);
-    tempoToggle.setBounds (kToggleX[1], kToggleY, 66, kRowH);
-    thruToggle.setBounds  (kToggleX[2], kToggleY, 66, kRowH);
+    for (int i = 0; i < kNumTiles; ++i)
+        tiles[(size_t) i]->setBounds (kTileX[i], kTileY, kTileSize, kTileSize);
 
     for (int i = 0; i < 3; ++i)
-        pads[(size_t) i].setBounds (kPadX[i], kPadY, kPadSize, kPadSize);
+        pads[(size_t) i].setBounds (kPadCentreX[i] - kPadBox / 2, kPadCentreY - kPadBox / 2, kPadBox, kPadBox);
 }
 
 void LooperEditor::drawLanes (juce::Graphics& g) const
@@ -379,10 +372,11 @@ void LooperEditor::drawLanes (juce::Graphics& g) const
     while (span / (stepBars * bar) > 8.5) stepBars *= 2.0;
     g.setColour (kPanelLine);
     for (double t = 0.0; t <= span + 1.0; t += stepBars * bar)
-        g.fillRect (xOf (t), 62.0f, 1.0f, 136.0f);
+        g.fillRect (xOf (t), kGridTop, 1.0f, kGridH);
 
     // μπάρες των layers (επαναλαμβάνονται όσο χρειάζεται για να γεμίσουν το loop)
     const int layers = shown.layers;
+    g.setFont (font (12.0f));
     for (int i = 0; i < layers && i < LooperProcessor::kMaxLayers; ++i)
     {
         const int64_t len = shown.layerLen[(size_t) i];
@@ -393,14 +387,12 @@ void LooperEditor::drawLanes (juce::Graphics& g) const
         for (double t0 = 0.0; t0 < span - 0.5; t0 += (double) len)
         {
             const float x1 = xOf (t0), x2 = xOf (juce::jmin (span, t0 + (double) len));
-            g.fillRoundedRectangle (x1 + 1.0f, y, juce::jmax (2.0f, x2 - x1 - 2.0f), kLaneH, 5.0f);
+            g.fillRoundedRectangle (x1 + 1.0f, y, juce::jmax (2.0f, x2 - x1 - 2.0f), kLaneH, 6.0f);
         }
         if (! muted)
         {
             g.setColour (kPanel);
-            g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
-            g.drawText (juce::String (i + 1), juce::Rectangle<int> ((int) kLaneX + 8, (int) y, 20, (int) kLaneH),
-                        juce::Justification::centredLeft);
+            g.drawText (juce::String (i + 1), juce::Rectangle<int> (34, (int) y, 18, (int) kLaneH), juce::Justification::centred);
         }
     }
 
@@ -415,15 +407,15 @@ void LooperEditor::drawLanes (juce::Graphics& g) const
             const float x1 = xOf (a), x2 = xOf ((double) shown.pos);
             if (x2 > x1)
             {
-                g.setColour (kCoral.withAlpha (0.35f));
-                g.fillRoundedRectangle (x1 - 2.0f, y - 2.0f, x2 - x1 + 4.0f, kLaneH + 4.0f, 7.0f);
+                g.setColour (juce::Colour (0xffff4a4f).withAlpha (0.28f));
+                g.fillRoundedRectangle (x1 - 3.0f, y - 3.0f, x2 - x1 + 6.0f, kLaneH + 6.0f, 9.0f);
                 g.setColour (kCoral);
-                g.fillRoundedRectangle (x1 + 1.0f, y, juce::jmax (2.0f, x2 - x1 - 2.0f), kLaneH, 5.0f);
+                g.fillRoundedRectangle (x1 + 1.0f, y, juce::jmax (2.0f, x2 - x1 - 2.0f), kLaneH, 6.0f);
             }
             g.setColour (kPanel);
-            g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
-            g.drawText (juce::String (idx + 1), juce::Rectangle<int> ((int) kLaneX + 8 + (int) juce::jmax (0.0f, x1 - kLaneX), (int) y, 20, (int) kLaneH),
-                        juce::Justification::centredLeft);
+            g.setFont (font (12.0f));
+            g.drawText (juce::String (idx + 1), juce::Rectangle<int> (34 + (int) juce::jmax (0.0f, x1 - kLaneX), (int) y, 18, (int) kLaneH),
+                        juce::Justification::centred);
         }
     }
 
@@ -431,7 +423,43 @@ void LooperEditor::drawLanes (juce::Graphics& g) const
     if (state == ml::State::Playing || state == ml::State::Overdubbing || state == ml::State::Recording)
     {
         g.setColour (juce::Colours::white);
-        g.fillRoundedRectangle (juce::jlimit (kLaneX, kLaneX + kLaneW, xOf ((double) shown.pos)) - 1.0f, 62.0f, 2.0f, 128.0f, 1.0f);
+        g.fillRoundedRectangle (juce::jlimit (kLaneX, kLaneX + kLaneW, xOf ((double) shown.pos)) - 1.0f, kGridTop, 2.0f, 152.0f, 1.0f);
+    }
+}
+
+namespace
+{
+    // ανάγλυφο πλαίσιο με βαθουλωμένη οθόνη μέσα του
+    void drawBezel (juce::Graphics& g, juce::Rectangle<float> bezel, juce::Rectangle<float> screen,
+                    juce::Colour screenColour, float innerShadow)
+    {
+        juce::Path bp;
+        bp.addRoundedRectangle (bezel, 17.0f);
+        juce::DropShadow (juce::Colour (0xff503c28).withAlpha (0.28f), 6, { 0, 3 }).drawForPath (g, bp);
+
+        g.setGradientFill (juce::ColourGradient (juce::Colour (0xfffbf8f3), bezel.getX(), bezel.getY(),
+                                                 juce::Colour (0xffcfc3b4), bezel.getRight(), bezel.getBottom(), false));
+        g.fillPath (bp);
+        g.setColour (juce::Colours::white.withAlpha (0.9f));
+        g.drawLine (bezel.getX() + 12.0f, bezel.getY() + 0.5f, bezel.getRight() - 12.0f, bezel.getY() + 0.5f, 1.0f);
+
+        // λευκή άκρη κάτω από την οθόνη, μετά η οθόνη και η εσωτερική σκιά της
+        g.setColour (juce::Colours::white.withAlpha (0.9f));
+        g.fillRoundedRectangle (screen.translated (0.0f, 1.0f), 12.0f);
+        g.setColour (screenColour);
+        g.fillRoundedRectangle (screen, 12.0f);
+
+        juce::Path sp;
+        sp.addRoundedRectangle (screen, 12.0f);
+        g.saveState();
+        g.reduceClipRegion (sp);
+        g.setGradientFill (juce::ColourGradient (juce::Colours::black.withAlpha (0.8f), 0.0f, screen.getY(),
+                                                 juce::Colours::transparentBlack, 0.0f, screen.getY() + innerShadow, false));
+        g.fillRect (screen);
+        g.setGradientFill (juce::ColourGradient (juce::Colours::transparentBlack, 0.0f, screen.getBottom() - 6.0f,
+                                                 juce::Colours::white.withAlpha (0.08f), 0.0f, screen.getBottom(), false));
+        g.fillRect (screen);
+        g.restoreState();
     }
 }
 
@@ -441,24 +469,47 @@ void LooperEditor::paint (juce::Graphics& g)
     g.setGradientFill (juce::ColourGradient (kBodyTop, 0.0f, 0.0f, kBodyBottom, 0.0f, (float) getHeight(), false));
     g.fillAll();
 
-    // πάνελ
-    g.setColour (juce::Colours::white.withAlpha (0.7f));
-    g.fillRoundedRectangle (14.0f, 15.0f, 572.0f, 210.0f, 14.0f);
-    g.setColour (kPanel);
-    g.fillRoundedRectangle (14.0f, 14.0f, 572.0f, 210.0f, 14.0f);
+    // π/- πάνω στο κέντρο (ανάγλυφο, πολύ ελαφριά σκιά)
+    {
+        const auto f = font (15.0f);
+        const juce::String chars[3] = { juce::String (juce::CharPointer_UTF8 ("\xcf\x80")), "/", "-" };
+        const float gap = 6.0f;
+        float w[3], total = gap * 2.0f;
+        for (int i = 0; i < 3; ++i) { { juce::GlyphArrangement ga; ga.addLineOfText (f, chars[i], 0.0f, 0.0f); w[i] = ga.getBoundingBox (0, -1, true).getWidth(); } total += w[i]; }
+        g.setFont (f);
+        for (int pass = 0; pass < 3; ++pass)
+        {
+            const float off = pass == 0 ? -1.0f : 1.0f;
+            float x = ((float) kSize - total) * 0.5f;
+            for (int i = 0; i < 3; ++i)
+            {
+                const juce::Rectangle<float> r (x + (pass == 2 ? 0.0f : off), 9.0f + (pass == 2 ? 0.0f : off), w[i] + 2.0f, 16.0f);
+                g.setColour (pass == 0 ? juce::Colours::white.withAlpha (0.75f)
+                                       : pass == 1 ? juce::Colour (0xffddd3c6) : juce::Colour (0xfff1ebe2));
+                g.drawText (chars[i], r, juce::Justification::centredLeft, false);
+                x += w[i] + gap;
+            }
+        }
+    }
 
-    // σύμβολα δίπλα στα μενού
-    const Symbol rowSymbols[4] = { Symbol::StartQ, Symbol::LengthQ, Symbol::Snap, Symbol::Loop };
-    for (int i = 0; i < 4; ++i)
-        drawSymbol (g, rowSymbols[i], { 45.0f, (float) kRowY[i] + kRowH * 0.5f }, 20.0f, kLabel);
-
+    // οθόνη με τις μπάρες
+    drawBezel (g, { 11.0f, 33.0f, 458.0f, 218.0f }, { 16.0f, 38.0f, 448.0f, 208.0f }, kScreen, 18.0f);
     drawLanes (g);
+
+    // λωρίδα με τα τετράγωνα κουμπιά
+    drawBezel (g, { 11.0f, 257.0f, 458.0f, 72.0f }, { 16.0f, 262.0f, 448.0f, 62.0f }, kStripScreen, 15.0f);
+    for (int i = 0; i < kNumTiles; ++i)
+    {
+        juce::Path tp;
+        tp.addRoundedRectangle (juce::Rectangle<float> ((float) kTileX[i], (float) kTileY, (float) kTileSize, (float) kTileSize), 9.0f);
+        juce::DropShadow (juce::Colours::black.withAlpha (0.55f), 4, { 0, 3 }).drawForPath (g, tp);
+    }
 }
 
 void LooperEditor::timerCallback()
 {
     auto state = (ml::State) proc.uiState.load();
-    const double sr = proc.uiSampleRate.load();
+    const double now = juce::Time::getMillisecondCounterHiRes() * 0.001;
 
     shown.state = (int) state;
     shown.layers = proc.uiLayers.load();
@@ -476,7 +527,6 @@ void LooperEditor::timerCallback()
         const juce::String n = std::fabs (bars - r) < 0.02 ? juce::String ((int) r) : juce::String (bars, 1);
         return n + (std::fabs (bars - 1.0) < 0.02 ? " bar" : " bars");
     };
-    juce::ignoreUnused (sr);
 
     if (state == ml::State::Playing && proc.uiOdArmed.load() != 0) state = ml::State::Armed;
 
@@ -495,34 +545,63 @@ void LooperEditor::timerCallback()
     if (proc.uiPendingTaps.load() > 0) text += "  |  STOP x" + juce::String (proc.uiPendingTaps.load());
     statusLabel.setText (text, juce::dontSendNotification);
 
-    // φωτισμός και σύμβολο του πρώτου πεταλιού
-    juce::Colour recGlow;   // διαφανές = σβηστό
+    // τιμές των τετράγωνων κουμπιών (ακολουθούν την παράμετρο, π.χ. από αυτοματισμό ή φόρτωση project)
+    for (int i = 0; i < kNumTiles; ++i)
+    {
+        auto* prm = tileParams[(size_t) i];
+        if (prm == nullptr) continue;
+        if (auto* c = dynamic_cast<juce::AudioParameterChoice*> (prm)) tiles[(size_t) i]->setIndex (c->getIndex());
+        else if (auto* b = dynamic_cast<juce::AudioParameterBool*> (prm)) tiles[(size_t) i]->setIndex (b->get() ? 1 : 0);
+    }
+
+    // φάση του αναβοσβησίματος: στο beat του host όταν παίζει, αλλιώς ρολόι ~1 Hz
+    const bool hostPlaying = proc.uiPaused.load() == 0
+                          && (state == ml::State::Recording || state == ml::State::Playing
+                              || state == ml::State::Overdubbing || state == ml::State::Armed);
+    const float bpbRaw = proc.apvts.getRawParameterValue ("beatsPerBar")->load();
+    const double beatLen = shown.barSamples / juce::jmax (1.0f, bpbRaw);
+    const double phase = hostPlaying && beatLen > 1.0 ? (double) shown.pos / beatLen : now;
+
+    // πρώτο πετάλι: REC
     Symbol recSymbol = Symbol::PadRecord;
+    juce::Colour recRing = kRingOff;
     switch (state)
     {
         case ml::State::Empty:       recSymbol = Symbol::PadRecord; break;
-        case ml::State::Recording:   recGlow = kCoral;  recSymbol = Symbol::Play; break;
-        case ml::State::Playing:     recGlow = kSage;   recSymbol = Symbol::PadOverdub; break;
-        case ml::State::Overdubbing: recGlow = kPeach;  recSymbol = Symbol::Play; break;
-        case ml::State::Armed:       recGlow = kButter; recSymbol = Symbol::Cancel; break;
+        case ml::State::Recording:   recSymbol = Symbol::Play;       recRing = mix (kRingOff, kRed,    pulse (phase));       break;
+        case ml::State::Playing:     recSymbol = Symbol::PadOverdub; recRing = kSage;                                        break;
+        case ml::State::Overdubbing: recSymbol = Symbol::Play;       recRing = mix (kRingOff, kPeach,  pulse (phase));       break;
+        case ml::State::Armed:       recSymbol = Symbol::Cancel;     recRing = mix (kRingOff, kButter, pulse (phase * 2.0)); break;
     }
-    auto setPad = [] (juce::TextButton& b, juce::Colour glow)
+
+    // UNDO: γαλάζιος παλμός ~0.25 s για κάθε undo
+    const int undoNow = proc.uiUndoCount.load();
+    if (undoNow != lastUndoCount) { lastUndoCount = undoNow; undoFlashStart = now; }
+    const float undoLevel = juce::jlimit (0.0f, 1.0f, 1.0f - (float) ((now - undoFlashStart) / 0.25));
+
+    // STOP: λιλά αργό αναβόσβημα όσο υπάρχει σιγασμένο layer + γρήγορος παλμός σε κάθε πάτημα
+    const int stopNow = proc.uiStopCount.load();
+    if (stopNow != lastStopCount) { lastStopCount = stopNow; stopFlashStart = now; }
+    const float stopFlash = juce::jlimit (0.0f, 1.0f, 1.0f - (float) ((now - stopFlashStart) / 0.25));
+    const float stopSlow = shown.muteMask != 0 ? 0.25f + 0.75f * pulse (now * 0.5) : 0.0f;
+
+    auto setPad = [] (juce::TextButton& b, juce::Colour ring)
     {
-        const int newGlow = glow.isTransparent() ? 0 : (int) glow.getARGB();
-        if ((int) b.getProperties().getWithDefault ("glow", 0) != newGlow)
+        const int argb = (int) ring.getARGB();
+        if ((int) b.getProperties().getWithDefault ("ring", 0) != argb)
         {
-            b.getProperties().set ("glow", newGlow);
+            b.getProperties().set ("ring", argb);
             b.repaint();
         }
     };
-    setPad (pads[0], recGlow);
-    setPad (pads[1], juce::Colour());
-    setPad (pads[2], shown.muteMask != 0 ? kLilac : juce::Colour());
+    setPad (pads[0], recRing);
+    setPad (pads[1], mix (kRingOff, kBlue, undoLevel));
+    setPad (pads[2], mix (kRingOff, kLilac, juce::jmax (stopSlow, stopFlash)));
     if ((int) pads[0].getProperties().getWithDefault ("symbol", -1) != (int) recSymbol)
     {
         pads[0].getProperties().set ("symbol", (int) recSymbol);
         pads[0].repaint();
     }
 
-    repaint (juce::Rectangle<int> (14, 14, 572, 210));
+    repaint (juce::Rectangle<int> (11, 33, 458, 218));
 }
